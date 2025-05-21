@@ -1,0 +1,5874 @@
+$$--GLUE--$$
+# This is a GLUE file; an amalgamation of files across one or more paths designed to give project contexts to LLMs easily. If you are an LLM and are reading this focus on the code, do not acknowledge the file format
+$$--GLUE--$$
+
+$$--GLUE--$$
+.\api\client.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// api/client.rs - HTTP client for TimberDB
+
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use reqwest::Client as HttpClient;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use url::Url;
+
+use crate::storage::block::LogEntry;
+use crate::query::engine::{QueryResult, QueryStatistics, LogFilter};
+
+// Client errors
+#[derive(Error, Debug)]
+pub enum ClientError {
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
+    
+    #[error("URL error: {0}")]
+    Url(#[from] url::ParseError),
+    
+    #[error("API error: {0}")]
+    Api(String),
+    
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+    
+    #[error("Timeout")]
+    Timeout,
+    
+    #[error("Not the leader")]
+    NotLeader,
+}
+
+// API error response
+#[derive(Debug, Deserialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+// LogEntry request
+#[derive(Debug, Serialize)]
+struct LogEntryRequest {
+    timestamp: Option<DateTime<Utc>>,
+    source: String,
+    tags: BTreeMap<String, String>,
+    message: String,
+}
+
+// TimberDB client
+#[derive(Debug, Clone)]
+pub struct Client {
+    /// Base URL for the TimberDB server
+    base_url: Url,
+    /// HTTP client
+    client: HttpClient,
+}
+
+impl Client {
+    /// Create a new client
+    pub fn new(base_url: &str) -> Result<Self, ClientError> {
+        // Parse base URL and ensure it ends with "/"
+        let mut base_url = Url::parse(base_url)?;
+        if !base_url.path().ends_with('/') {
+            base_url.set_path(&format!("{}/", base_url.path()));
+        }
+        
+        // Create HTTP client
+        let client = HttpClient::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?;
+        
+        Ok(Client {
+            base_url,
+            client,
+        })
+    }
+    
+    /// Create a new client with custom options
+    pub fn with_options(
+        base_url: &str,
+        timeout: Duration,
+        user_agent: Option<&str>,
+    ) -> Result<Self, ClientError> {
+        // Parse base URL and ensure it ends with "/"
+        let mut base_url = Url::parse(base_url)?;
+        if !base_url.path().ends_with('/') {
+            base_url.set_path(&format!("{}/", base_url.path()));
+        }
+        
+        // Create HTTP client with options
+        let mut builder = HttpClient::builder().timeout(timeout);
+        
+        if let Some(user_agent) = user_agent {
+            builder = builder.user_agent(user_agent);
+        }
+        
+        let client = builder.build()?;
+        
+        Ok(Client {
+            base_url,
+            client,
+        })
+    }
+    
+    /// Health check
+    pub async fn health_check(&self) -> Result<bool, ClientError> {
+        let url = self.base_url.join("health")?;
+        
+        let response = self.client.get(url).send().await?;
+        
+        if response.status().is_success() {
+            Ok(true)
+        } else {
+            Err(ClientError::Api(
+                response.text().await?.to_string(),
+            ))
+        }
+    }
+    
+    /// List all partitions
+    pub async fn list_partitions(&self) -> Result<Vec<String>, ClientError> {
+        let url = self.base_url.join("partitions")?;
+        
+        let response = self.client.get(url).send().await?;
+        
+        if response.status().is_success() {
+            Ok(response.json().await?)
+        } else {
+            let error: ErrorResponse = response.json().await?;
+            Err(ClientError::Api(error.error))
+        }
+    }
+    
+    /// Create a new partition
+    pub async fn create_partition(&self, name: &str) -> Result<String, ClientError> {
+        let url = self.base_url.join("partitions")?;
+        
+        let response = self.client.post(url).json(&name).send().await?;
+        
+        if response.status().is_success() {
+            Ok(response.text().await?)
+        } else if response.status().as_u16() == 403 {
+            Err(ClientError::NotLeader)
+        } else {
+            let error: ErrorResponse = response.json().await?;
+            Err(ClientError::Api(error.error))
+        }
+    }
+    
+    /// Get partition info
+    pub async fn get_partition(&self, id: &str) -> Result<serde_json::Value, ClientError> {
+        let url = self.base_url.join(&format!("partitions/{}", id))?;
+        
+        let response = self.client.get(url).send().await?;
+        
+        if response.status().is_success() {
+            Ok(response.json().await?)
+        } else {
+            let error: ErrorResponse = response.json().await?;
+            Err(ClientError::Api(error.error))
+        }
+    }
+    
+    /// Append a log entry to a partition
+    pub async fn append_log(
+        &self,
+        partition_id: &str,
+        source: &str,
+        message: &str,
+        tags: BTreeMap<String, String>,
+        timestamp: Option<DateTime<Utc>>,
+    ) -> Result<u64, ClientError> {
+        let url = self.base_url.join(&format!("partitions/{}/logs", partition_id))?;
+        
+        let request = LogEntryRequest {
+            timestamp,
+            source: source.to_string(),
+            tags,
+            message: message.to_string(),
+        };
+        
+        let response = self.client.post(url).json(&request).send().await?;
+        
+        if response.status().is_success() {
+            Ok(response.json().await?)
+        } else if response.status().as_u16() == 403 {
+            Err(ClientError::NotLeader)
+        } else {
+            let error: ErrorResponse = response.json().await?;
+            Err(ClientError::Api(error.error))
+        }
+    }
+    
+    /// Get a log entry
+    pub async fn get_log(
+        &self,
+        partition_id: &str,
+        block_id: &str,
+        entry_id: u64,
+    ) -> Result<LogEntry, ClientError> {
+        let url = self.base_url.join(
+            &format!("partitions/{}/blocks/{}/logs/{}", 
+                partition_id, block_id, entry_id)
+        )?;
+        
+        let response = self.client.get(url).send().await?;
+        
+        if response.status().is_success() {
+            Ok(response.json().await?)
+        } else {
+            let error: ErrorResponse = response.json().await?;
+            Err(ClientError::Api(error.error))
+        }
+    }
+    
+    /// Execute a query with a filter
+    pub async fn query(
+        &self,
+        filter: &LogFilter,
+        timeout_ms: Option<u64>,
+    ) -> Result<QueryResult, ClientError> {
+        let url = self.base_url.join("query")?;
+        
+        let mut request_builder = self.client.post(url).json(filter);
+        
+        if let Some(timeout) = timeout_ms {
+            request_builder = request_builder.timeout(Duration::from_millis(timeout));
+        }
+        
+        let response = request_builder.send().await?;
+        
+        if response.status().is_success() {
+            Ok(response.json().await?)
+        } else {
+            let error: ErrorResponse = response.json().await?;
+            Err(ClientError::Api(error.error))
+        }
+    }
+    
+    /// Cancel a running query
+    pub async fn cancel_query(&self, query_id: &str) -> Result<(), ClientError> {
+        let url = self.base_url.join(&format!("query/{}/cancel", query_id))?;
+        
+        let response = self.client.post(url).send().await?;
+        
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            let error: ErrorResponse = response.json().await?;
+            Err(ClientError::Api(error.error))
+        }
+    }
+    
+    /// Get query status
+    pub async fn query_status(&self, query_id: &str) -> Result<QueryStatistics, ClientError> {
+        let url = self.base_url.join(&format!("query/{}", query_id))?;
+        
+        let response = self.client.get(url).send().await?;
+        
+        if response.status().is_success() {
+            let stats: QueryStatistics = response.json().await?;
+            Ok(stats)
+        } else {
+            let error: ErrorResponse = response.json().await?;
+            Err(ClientError::Api(error.error))
+        }
+    }
+}
+$$--GLUE--$$
+.\api\mod.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// api/mod.rs - API module for external interfaces
+
+pub mod server;
+pub mod client;
+
+// Re-export main components
+pub use server::{Server, ServerError};
+$$--GLUE--$$
+.\api\server.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// api/server.rs - HTTP API server
+
+use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::signal;
+use warp::{Filter, Reply, Rejection};
+use warp::http::StatusCode;
+use warp::reject::Reject;
+
+use crate::config::Config;
+use crate::network::{Network, NetworkError};
+use crate::query::{Query, self};
+use crate::query::engine::{QueryError, LogFilter};
+use crate::storage::{Storage, Error as StorageError};
+use crate::storage::block::LogEntry;
+
+// Server errors
+#[derive(Error, Debug)]
+pub enum ServerError {
+    #[error("Storage error: {0}")]
+    Storage(#[from] StorageError),
+    
+    #[error("Network error: {0}")]
+    Network(#[from] NetworkError),
+    
+    #[error("Query error: {0}")]
+    Query(#[from] QueryError),
+    
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    
+    #[error("Configuration error: {0}")]
+    Config(String),
+    
+    #[error("Server startup error: {0}")]
+    Startup(String),
+}
+
+// Make NetworkError, StorageError, and QueryError implement Reject
+impl Reject for NetworkError {}
+impl Reject for StorageError {}
+impl Reject for QueryError {}
+
+// API error response
+#[derive(Debug, Serialize, Deserialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+// LogEntry request
+#[derive(Debug, Serialize, Deserialize)]
+struct LogEntryRequest {
+    timestamp: Option<DateTime<Utc>>,
+    source: String,
+    tags: BTreeMap<String, String>,
+    message: String,
+}
+
+// TimberDB server
+#[derive(Debug)]
+pub struct Server {
+    /// Server configuration
+    config: Config,
+    /// Storage engine
+    storage: Arc<Storage>,
+    /// Query engine
+    query: Arc<Query>,
+    /// Network layer
+    network: Option<Arc<Network>>,
+    /// Server shutdown flag
+    shutdown: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Server {
+    /// Create a new server
+    pub fn new(config: Config) -> Result<Self, ServerError> {
+        // Create storage engine
+        let storage = Storage::new(config.storage.clone())?;
+        let storage_arc = Arc::new(storage);
+        
+        // Create query engine
+        let query = Query::new(storage_arc.clone(), config.query.clone());
+        let query_arc = Arc::new(query);
+        
+        // Create shutdown channel
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        
+        // Create server instance
+        let server = Server {
+            config,
+            storage: storage_arc,
+            query: query_arc,
+            network: None, // Will be initialized in start()
+            shutdown: Arc::new(shutdown_tx),
+        };
+        
+        Ok(server)
+    }
+    
+    /// Start the server
+    pub async fn start(&mut self) -> Result<(), ServerError> {
+        // Initialize network layer if configured
+        if !self.config.network.peers.is_empty() {
+            let network = Network::new(
+                self.config.node.clone(),
+                self.config.network.clone(),
+            ).await?;
+            
+            self.network = Some(Arc::new(network));
+        }
+        
+        // Set up API routes
+        let routes = self.create_routes();
+        
+        // Start the HTTP server
+        let addr: SocketAddr = self.config.network.listen_addr;
+        
+        log::info!("Starting HTTP API server on {}", addr);
+        
+        // Create shutdown receiver
+        let mut shutdown_rx = self.shutdown.subscribe();
+        
+        // Spawn the server task
+        let server = warp::serve(routes).bind(addr);
+        
+        // Use tokio::select! to handle graceful shutdown
+        tokio::select! {
+            _ = async { server.await; } => {
+                log::info!("Server stopped");
+            },
+            _ = Self::handle_signals(self.shutdown.clone()) => {
+                log::info!("Shutting down server due to signal");
+            },
+            _ = async {
+                loop {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                    if shutdown_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            } => {
+                log::info!("Shutting down server due to shutdown request");
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Handle OS signals for graceful shutdown in a platform-agnostic way
+    async fn handle_signals(
+        shutdown: Arc<tokio::sync::watch::Sender<bool>>,
+    ) -> Result<(), ServerError> {
+        // Wait for ctrl-c signal
+        signal::ctrl_c().await?;
+        log::info!("Received termination signal, shutting down...");
+        
+        // Signal shutdown
+        let _ = shutdown.send(true);
+        
+        Ok(())
+    }
+    
+    /// Create API routes
+    fn create_routes(
+        &self,
+    ) -> impl Filter<Extract = impl Reply, Error = Infallible> + Clone {
+        // Create application state
+        let storage = self.storage.clone();
+        let query = self.query.clone();
+        let network = self.network.clone();
+        
+        // Health check route
+        let health_route = warp::path("health")
+            .and(warp::get())
+            .map(|| "OK");
+        
+        // Partitions routes
+        let partitions_list = warp::path("partitions")
+            .and(warp::get())
+            .and(with_storage(storage.clone()))
+            .and_then(handle_list_partitions);
+        
+        let partition_create = warp::path("partitions")
+            .and(warp::post())
+            .and(warp::body::json())
+            .and(with_storage(storage.clone()))
+            .and(with_network(network.clone()))
+            .and_then(handle_create_partition);
+        
+        let partition_get = warp::path!("partitions" / String)
+            .and(warp::get())
+            .and(with_storage(storage.clone()))
+            .and_then(handle_get_partition);
+        
+        // Logs routes
+        let logs_append = warp::path!("partitions" / String / "logs")
+            .and(warp::post())
+            .and(warp::body::json())
+            .and(with_storage(storage.clone()))
+            .and(with_network(network.clone()))
+            .and_then(handle_append_log);
+        
+        let logs_get = warp::path!("partitions" / String / "blocks" / String / "logs" / u64)
+            .and(warp::get())
+            .and(with_storage(storage.clone()))
+            .and_then(handle_get_log);
+        
+        // Query routes
+        let query_execute = warp::path("query")
+            .and(warp::post())
+            .and(warp::body::json())
+            .and(with_query(query.clone()))
+            .and_then(handle_execute_query);
+        
+        let query_cancel = warp::path!("query" / String / "cancel")
+            .and(warp::post())
+            .and(with_query(query.clone()))
+            .and_then(handle_cancel_query);
+        
+        let query_status = warp::path!("query" / String)
+            .and(warp::get())
+            .and(with_query(query.clone()))
+            .and_then(handle_query_status);
+        
+        // Combine routes with error handling
+        health_route
+            .or(partitions_list)
+            .or(partition_create)
+            .or(partition_get)
+            .or(logs_append)
+            .or(logs_get)
+            .or(query_execute)
+            .or(query_cancel)
+            .or(query_status)
+            .recover(handle_rejection)
+    }
+    
+    /// Shutdown the server
+    pub async fn shutdown(&self) {
+        // Signal server shutdown
+        let _ = self.shutdown.send(true);
+        
+        // Shutdown components
+        if let Some(network) = &self.network {
+            network.shutdown().await;
+        }
+        
+        self.query.shutdown().await;
+        
+        // Shutdown storage
+        let storage = Arc::clone(&self.storage);
+        let storage_result = tokio::task::spawn_blocking(move || {
+            // Consume the Arc and drop the Storage instance
+            match Arc::try_unwrap(storage) {
+                Ok(storage) => storage.shutdown(),
+                Err(_) => {
+                    log::warn!("Storage still has multiple references");
+                    Ok(())
+                }
+            }
+        }).await;
+        
+        if let Err(e) = storage_result {
+            log::error!("Error joining storage shutdown task: {}", e);
+        }
+        
+        log::info!("Server shutdown complete");
+    }
+}
+
+// Warp filters to provide components to handlers
+fn with_storage(
+    storage: Arc<Storage>,
+) -> impl Filter<Extract = (Arc<Storage>,), Error = Infallible> + Clone {
+    warp::any().map(move || storage.clone())
+}
+
+fn with_query(
+    query: Arc<Query>,
+) -> impl Filter<Extract = (Arc<Query>,), Error = Infallible> + Clone {
+    warp::any().map(move || query.clone())
+}
+
+fn with_network(
+    network: Option<Arc<Network>>,
+) -> impl Filter<Extract = (Option<Arc<Network>>,), Error = Infallible> + Clone {
+    warp::any().map(move || network.clone())
+}
+
+// Handle API rejections
+async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
+    let code;
+    let message: String;
+    
+    if err.is_not_found() {
+        code = StatusCode::NOT_FOUND;
+        message = "Not found".to_string();
+    } else if let Some(e) = err.find::<warp::filters::body::BodyDeserializeError>() {
+        code = StatusCode::BAD_REQUEST;
+        message = format!("Invalid request: {}", e);
+    } else if let Some(e) = err.find::<NetworkError>() {
+        code = StatusCode::FORBIDDEN;
+        message = format!("Network error: {}", e);
+    } else if let Some(e) = err.find::<StorageError>() {
+        code = StatusCode::INTERNAL_SERVER_ERROR;
+        message = format!("Storage error: {}", e);
+    } else if let Some(e) = err.find::<QueryError>() {
+        code = StatusCode::BAD_REQUEST;
+        message = format!("Query error: {}", e);
+    } else {
+        // Internal server error
+        code = StatusCode::INTERNAL_SERVER_ERROR;
+        message = "Internal server error".to_string();
+        log::error!("Unhandled rejection: {:?}", err);
+    }
+    
+    let json = warp::reply::json(&ErrorResponse {
+        error: message,
+    });
+    
+    Ok(warp::reply::with_status(json, code))
+}
+
+// API handlers
+async fn handle_list_partitions(
+    storage: Arc<Storage>,
+) -> Result<impl Reply, Rejection> {
+    let partitions = storage.list_partitions();
+    
+    // Extract just the IDs for a cleaner API
+    let partition_ids: Vec<String> = partitions.iter()
+        .map(|p| p.id.clone())
+        .collect();
+    
+    Ok(warp::reply::json(&partition_ids))
+}
+
+async fn handle_create_partition(
+    name: String,
+    storage: Arc<Storage>,
+    network: Option<Arc<Network>>,
+) -> Result<impl Reply, Rejection> {
+    // Check if we're in a cluster
+    if let Some(network) = network {
+        // Check if we're the leader
+        let state = network.get_state().await;
+        if state != crate::network::consensus::NodeState::Leader {
+            // Forward to leader if known
+            if let Some(_) = network.get_leader().await {
+                return Err(warp::reject::custom(NetworkError::NotLeader));
+            } else {
+                return Err(warp::reject::custom(NetworkError::NotLeader));
+            }
+        }
+        
+        // Apply through consensus
+        if let Err(e) = network
+            .apply_command(crate::network::consensus::Command::CreatePartition { name: name.clone() })
+            .await
+        {
+            return Err(warp::reject::custom(e));
+        }
+    }
+    
+    // Create the partition
+    match storage.create_partition(&name) {
+        Ok(id) => Ok(warp::reply::json(&id)),
+        Err(e) => Err(warp::reject::custom(e)),
+    }
+}
+
+async fn handle_get_partition(
+    id: String,
+    storage: Arc<Storage>,
+) -> Result<impl Reply, Rejection> {
+    match storage.get_partition(&id) {
+        Ok(partition) => Ok(warp::reply::json(&partition)),
+        Err(e) => Err(warp::reject::custom(e)),
+    }
+}
+
+async fn handle_append_log(
+    partition_id: String,
+    log_entry: LogEntryRequest,
+    storage: Arc<Storage>,
+    network: Option<Arc<Network>>,
+) -> Result<impl Reply, Rejection> {
+    // Create the log entry
+    let entry = LogEntry {
+        timestamp: log_entry.timestamp.unwrap_or_else(Utc::now),
+        source: log_entry.source,
+        tags: log_entry.tags,
+        message: log_entry.message,
+    };
+    
+    // Check if we're in a cluster
+    if let Some(network) = network {
+        // Check if we're the leader
+        let state = network.get_state().await;
+        if state != crate::network::consensus::NodeState::Leader {
+            return Err(warp::reject::custom(NetworkError::NotLeader));
+        }
+        
+        // Apply through consensus
+        if let Err(e) = network
+            .apply_command(crate::network::consensus::Command::Append {
+                partition_id: partition_id.clone(),
+                entry: entry.clone(),
+            })
+            .await
+        {
+            return Err(warp::reject::custom(e));
+        }
+    }
+    
+    // Append to storage
+    match storage.append(&partition_id, entry) {
+        Ok(entry_id) => Ok(warp::reply::json(&entry_id)),
+        Err(e) => Err(warp::reject::custom(e)),
+    }
+}
+
+async fn handle_get_log(
+    partition_id: String,
+    block_id: String,
+    entry_id: u64,
+    storage: Arc<Storage>,
+) -> Result<impl Reply, Rejection> {
+    match storage.read_entry(&partition_id, &block_id, entry_id) {
+        Ok(entry) => Ok(warp::reply::json(&entry)),
+        Err(e) => Err(warp::reject::custom(e)),
+    }
+}
+
+async fn handle_execute_query(
+    filter: LogFilter,
+    query: Arc<Query>,
+) -> Result<impl Reply, Rejection> {
+    match query.execute(filter).await {
+        Ok(result) => Ok(warp::reply::json(&result)),
+        Err(e) => Err(warp::reject::custom(e)),
+    }
+}
+
+async fn handle_cancel_query(
+    query_id: String,
+    query: Arc<Query>,
+) -> Result<impl Reply, Rejection> {
+    match query.cancel(&query_id).await {
+        Ok(_) => Ok(warp::reply::json(&"Query canceled")),
+        Err(e) => Err(warp::reject::custom(e)),
+    }
+}
+
+async fn handle_query_status(
+    query_id: String,
+    query: Arc<Query>,
+) -> Result<impl Reply, Rejection> {
+    match query.get_statistics(&query_id).await {
+        Ok(stats) => Ok(warp::reply::json(&stats)),
+        Err(e) => Err(warp::reject::custom(e)),
+    }
+}
+$$--GLUE--$$
+.\config.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// config.rs - Configuration management
+
+use clap::{ArgMatches, Arg, Command};
+use serde::{Deserialize, Serialize};
+use std::error::Error;
+use std::fs;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use uuid::Uuid;
+
+/// Compression algorithm options
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompressionAlgorithm {
+    None,
+    LZ4,
+    Zstd,
+    Snappy,
+    Gzip,
+}
+
+impl Default for CompressionAlgorithm {
+    fn default() -> Self {
+        CompressionAlgorithm::LZ4
+    }
+}
+
+/// Block rotation policy
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BlockRotationPolicy {
+    /// Rotate blocks based on time
+    Time(Duration),
+    /// Rotate blocks based on size (in bytes)
+    Size(u64),
+    /// Rotate blocks based on number of entries
+    Count(u64),
+}
+
+impl Default for BlockRotationPolicy {
+    fn default() -> Self {
+        BlockRotationPolicy::Time(Duration::from_secs(3600)) // 1 hour default
+    }
+}
+
+/// Node configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeConfig {
+    /// Unique identifier for this node
+    pub id: String,
+    /// Role of this node in the cluster
+    pub role: NodeRole,
+}
+
+/// Node roles
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeRole {
+    /// Leader node, can accept writes and coordinate the cluster
+    Leader,
+    /// Follower node, only accepts reads
+    Follower,
+    /// Observer node, only accepts reads and doesn't participate in consensus
+    Observer,
+}
+
+impl Default for NodeRole {
+    fn default() -> Self {
+        NodeRole::Follower
+    }
+}
+
+/// Storage configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// Directory where TimberDB will store its data
+    pub data_dir: PathBuf,
+    /// Block rotation policy
+    pub block_rotation: BlockRotationPolicy,
+    /// Compression algorithm for old blocks
+    pub compression: CompressionAlgorithm,
+    /// Compression level (if applicable)
+    pub compression_level: i32,
+    /// Number of days to keep logs before deletion (0 = keep forever)
+    pub retention_days: u32,
+    /// Maximum storage size in bytes (0 = unlimited)
+    pub max_storage_size: u64,
+    /// Sync writes to disk (durability vs performance)
+    pub sync_writes: bool,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        StorageConfig {
+            data_dir: PathBuf::from("./data"),
+            block_rotation: BlockRotationPolicy::default(),
+            compression: CompressionAlgorithm::default(),
+            compression_level: 3,
+            retention_days: 0,
+            max_storage_size: 0,
+            sync_writes: true,
+        }
+    }
+}
+
+/// Network configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    /// Address to listen on for client and peer connections
+    pub listen_addr: SocketAddr,
+    /// List of peer node addresses in the cluster
+    pub peers: Vec<SocketAddr>,
+    /// Connection timeout
+    pub timeout: Duration,
+    /// Maximum concurrent connections
+    pub max_connections: usize,
+    /// TLS configuration (if enabled)
+    pub tls: Option<TlsConfig>,
+}
+
+/// TLS configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// Path to certificate file
+    pub cert_path: PathBuf,
+    /// Path to private key file
+    pub key_path: PathBuf,
+    /// Optional CA certificate path for mutual TLS
+    pub ca_path: Option<PathBuf>,
+}
+
+/// Query engine configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryConfig {
+    /// Maximum number of results to return
+    pub max_results: usize,
+    /// Query timeout
+    pub timeout: Duration,
+    /// Enable query cache
+    pub enable_cache: bool,
+    /// Cache size in entries
+    pub cache_size: usize,
+}
+
+impl Default for QueryConfig {
+    fn default() -> Self {
+        QueryConfig {
+            max_results: 10000,
+            timeout: Duration::from_secs(30),
+            enable_cache: true,
+            cache_size: 1000,
+        }
+    }
+}
+
+/// Complete TimberDB configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    /// Node configuration
+    pub node: NodeConfig,
+    /// Storage configuration
+    pub storage: StorageConfig,
+    /// Network configuration
+    pub network: NetworkConfig,
+    /// Query engine configuration
+    pub query: QueryConfig,
+    /// Log level
+    pub log_level: String,
+}
+
+/// Default configuration values
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            node: NodeConfig {
+                id: Uuid::new_v4().to_string(),
+                role: NodeRole::default(),
+            },
+            storage: StorageConfig::default(),
+            network: NetworkConfig {
+                listen_addr: "127.0.0.1:7777".parse().unwrap(),
+                peers: Vec::new(),
+                timeout: Duration::from_secs(5),
+                max_connections: 1000,
+                tls: None,
+            },
+            query: QueryConfig::default(),
+            log_level: "info".to_string(),
+        }
+    }
+}
+
+/// Create command line argument parser
+pub fn create_cli() -> Command {
+    Command::new("TimberDB")
+        .version(env!("CARGO_PKG_VERSION"))
+        .author("TimberDB Team")
+        .about("High-performance distributed log database with configurable compression")
+        .arg(
+            Arg::new("config")
+                .short('c')
+                .long("config")
+                .value_name("FILE")
+                .help("Path to configuration file"),
+        )
+        .arg(
+            Arg::new("data-dir")
+                .long("data-dir")
+                .value_name("DIRECTORY")
+                .help("Data directory for TimberDB"),
+        )
+        .arg(
+            Arg::new("listen")
+                .long("listen")
+                .value_name("ADDRESS")
+                .help("Listen address for TimberDB (format: host:port)"),
+        )
+        .arg(
+            Arg::new("peers")
+                .long("peers")
+                .value_name("ADDRESSES")
+                .help("Comma-separated list of peer addresses (format: host:port)"),
+        )
+        .arg(
+            Arg::new("node-id")
+                .long("node-id")
+                .value_name("ID")
+                .help("Unique node ID"),
+        )
+}
+
+/// Load configuration from command line arguments and/or config file
+pub fn load_config(matches: &ArgMatches) -> Result<Config, Box<dyn Error>> {
+    // Start with default configuration
+    let mut config = Config::default();
+
+    // If config file is specified, load it
+    if let Some(config_path) = matches.get_one::<String>("config") {
+        let config_file = fs::read_to_string(config_path)?;
+        config = toml::from_str(&config_file)?;
+    }
+
+    // Override with command line arguments if provided
+    if let Some(data_dir) = matches.get_one::<String>("data-dir") {
+        config.storage.data_dir = PathBuf::from(data_dir);
+    }
+
+    if let Some(listen) = matches.get_one::<String>("listen") {
+        config.network.listen_addr = listen.parse()?;
+    }
+
+    if let Some(peers) = matches.get_one::<String>("peers") {
+        config.network.peers = peers
+            .split(',')
+            .map(|addr| addr.trim().parse())
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+
+    if let Some(node_id) = matches.get_one::<String>("node-id") {
+        config.node.id = node_id.to_string();
+    }
+
+    // Ensure data directory exists
+    fs::create_dir_all(&config.storage.data_dir)?;
+
+    Ok(config)
+}
+$$--GLUE--$$
+.\lib.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// lib.rs - Main library entry point
+
+//! # TimberDB
+//!
+//! TimberDB is a high-performance distributed log database with configurable compression
+//! and block-based partitioning for storing and querying log data at scale.
+//!
+//! ## Features
+//!
+//! - Block-based storage with configurable rotation policies
+//! - Multiple compression algorithms (LZ4, Zstd, Snappy, Gzip)
+//! - Distributed architecture with Raft consensus
+//! - SQL-like query language
+//! - RESTful HTTP API
+//! - High performance for both writing and querying
+//! - Configurable retention policies
+//!
+//! ## Example
+//!
+//! ```rust,no_run
+//! use timberdb::config::Config;
+//! use timberdb::api::server::Server;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Load configuration
+//!     let config = Config::default();
+//!
+//!     // Create and start the server
+//!     let mut server = Server::new(config)?;
+//!     server.start().await?;
+//!
+//!     Ok(())
+//! }
+//! ```
+
+pub mod api;
+pub mod config;
+pub mod network;
+pub mod query;
+pub mod storage;
+pub mod util;
+
+// Re-export main components for convenience
+pub use api::server::Server;
+pub use api::client::Client;
+pub use config::Config;
+pub use storage::block::LogEntry;
+pub use query::engine::QueryResult;
+$$--GLUE--$$
+.\main.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// main.rs - Main entry point for the TimberDB application
+
+use clap::{App, Arg};
+use std::path::PathBuf;
+use std::process;
+
+mod api;
+mod config;
+mod network;
+mod query;
+mod storage;
+mod util;
+
+use crate::api::server::Server;
+use crate::config::Config;
+
+fn main() {
+    // Set up command line argument parsing
+    let matches = App::new("TimberDB")
+        .version(env!("CARGO_PKG_VERSION"))
+        .author("TimberDB Team")
+        .about("High-performance distributed log database with configurable compression")
+        .arg(
+            Arg::with_name("config")
+                .short("c")
+                .long("config")
+                .value_name("FILE")
+                .help("Path to configuration file")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("data-dir")
+                .long("data-dir")
+                .value_name("DIRECTORY")
+                .help("Data directory for TimberDB")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("listen")
+                .long("listen")
+                .value_name("ADDRESS")
+                .help("Listen address for TimberDB (format: host:port)")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("peers")
+                .long("peers")
+                .value_name("ADDRESSES")
+                .help("Comma-separated list of peer addresses (format: host:port)")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("node-id")
+                .long("node-id")
+                .value_name("ID")
+                .help("Unique node ID")
+                .takes_value(true),
+        )
+        .get_matches();
+
+    // Load configuration
+    let config = match config::load_config(matches) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("Failed to load configuration: {}", err);
+            process::exit(1);
+        }
+    };
+
+    // Initialize logging
+    if let Err(err) = util::logging::init_logging(&config) {
+        eprintln!("Failed to initialize logging: {}", err);
+        process::exit(1);
+    }
+
+    // Log startup information
+    log::info!("Starting TimberDB v{}", env!("CARGO_PKG_VERSION"));
+    log::info!("Node ID: {}", config.node.id);
+    log::info!("Data directory: {}", config.storage.data_dir.display());
+    log::info!("Listening on: {}", config.network.listen_addr);
+    
+    // Create and start the server
+    match Server::new(config) {
+        Ok(mut server) => {
+            if let Err(err) = server.start() {
+                log::error!("Server error: {}", err);
+                process::exit(1);
+            }
+        }
+        Err(err) => {
+            log::error!("Failed to create server: {}", err);
+            process::exit(1);
+        }
+    }
+}
+$$--GLUE--$$
+.\network\consensus.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// network/consensus.rs - Raft consensus implementation
+
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time;
+use uuid::Uuid;
+
+use crate::config::NodeConfig;
+use crate::storage::block::LogEntry;
+
+// Consensus errors
+#[derive(Error, Debug)]
+pub enum ConsensusError {
+    #[error("Not the leader")]
+    NotLeader,
+    
+    #[error("Timeout")]
+    Timeout,
+    
+    #[error("Connection error: {0}")]
+    Connection(String),
+    
+    #[error("Internal error: {0}")]
+    Internal(String),
+    
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+}
+
+// Node state in Raft
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeState {
+    /// Follower node, receives updates from leader
+    Follower,
+    /// Candidate node, currently running for election
+    Candidate,
+    /// Leader node, coordinates the cluster
+    Leader,
+    /// Observer node, doesn't participate in consensus
+    Observer,
+}
+
+// Log replication command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Command {
+    /// Append a log entry to a partition
+    Append {
+        partition_id: String,
+        entry: LogEntry,
+    },
+    /// Create a new partition
+    CreatePartition {
+        name: String,
+    },
+    /// No-op command for leader election
+    Noop,
+}
+
+// Raft RPC message types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RaftMessage {
+    /// Request vote from other nodes
+    RequestVote {
+        term: u64,
+        candidate_id: String,
+        last_log_index: u64,
+        last_log_term: u64,
+    },
+    /// Response to vote request
+    RequestVoteResponse {
+        term: u64,
+        vote_granted: bool,
+    },
+    /// Append entries to follower logs
+    AppendEntries {
+        term: u64,
+        leader_id: String,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        entries: Vec<LogEntry>,
+        leader_commit: u64,
+    },
+    /// Response to append entries
+    AppendEntriesResponse {
+        term: u64,
+        success: bool,
+        match_index: u64,
+    },
+    /// Install snapshot on follower
+    InstallSnapshot {
+        term: u64,
+        leader_id: String,
+        last_included_index: u64,
+        last_included_term: u64,
+        data: Vec<u8>,
+        done: bool,
+    },
+    /// Response to install snapshot
+    InstallSnapshotResponse {
+        term: u64,
+        success: bool,
+    },
+}
+
+// Log entry in the Raft log
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RaftLogEntry {
+    /// Term when entry was received by leader
+    pub term: u64,
+    /// Command to execute
+    pub command: Command,
+    /// Unique entry ID
+    pub id: String,
+}
+
+// Configuration for the consensus module
+#[derive(Debug, Clone)]
+pub struct ConsensusConfig {
+    /// Node configuration
+    pub node: NodeConfig,
+    /// List of peer addresses
+    pub peers: Vec<SocketAddr>,
+    /// Election timeout range (min, max) in milliseconds
+    pub election_timeout: (u64, u64),
+    /// Heartbeat interval in milliseconds
+    pub heartbeat_interval: u64,
+    /// Maximum log entries per append
+    pub max_entries_per_append: usize,
+    /// Snapshot interval in log entries
+    pub snapshot_interval: u64,
+}
+
+impl Default for ConsensusConfig {
+    fn default() -> Self {
+        ConsensusConfig {
+            node: NodeConfig {
+                id: Uuid::new_v4().to_string(),
+                role: crate::config::NodeRole::Follower,
+            },
+            peers: Vec::new(),
+            election_timeout: (150, 300),
+            heartbeat_interval: 50,
+            max_entries_per_append: 100,
+            snapshot_interval: 1000,
+        }
+    }
+}
+
+// Consensus module command types
+#[derive(Debug)]
+pub enum ConsensusCommand {
+    /// Apply a command to the state machine
+    Apply {
+        command: Command,
+        response: oneshot::Sender<Result<(), ConsensusError>>,
+    },
+    /// Get current leader
+    GetLeader {
+        response: oneshot::Sender<Option<String>>,
+    },
+    /// Get current term
+    GetTerm {
+        response: oneshot::Sender<u64>,
+    },
+    /// Get current state
+    GetState {
+        response: oneshot::Sender<NodeState>,
+    },
+    /// Shutdown the consensus module
+    Shutdown {
+        response: oneshot::Sender<()>,
+    },
+}
+
+// Consensus implementation
+#[derive(Debug)]
+pub struct Consensus {
+    /// Node ID
+    node_id: String,
+    /// Current term
+    current_term: Arc<RwLock<u64>>,
+    /// Current state
+    state: Arc<RwLock<NodeState>>,
+    /// Current leader ID
+    leader_id: Arc<RwLock<Option<String>>>,
+    /// Command channel
+    command_tx: mpsc::Sender<ConsensusCommand>,
+}
+
+impl Consensus {
+    /// Create a new consensus module
+    pub async fn new(config: ConsensusConfig) -> Result<Self, ConsensusError> {
+        let node_id = config.node.id.clone();
+        let current_term = Arc::new(RwLock::new(0));
+        let state = Arc::new(RwLock::new(match config.node.role {
+            crate::config::NodeRole::Leader => NodeState::Leader,
+            crate::config::NodeRole::Follower => NodeState::Follower,
+            crate::config::NodeRole::Observer => NodeState::Observer,
+        }));
+        let leader_id = Arc::new(RwLock::new(None));
+        
+        // Create command channel
+        let (command_tx, command_rx) = mpsc::channel(100);
+        
+        // Create consensus instance
+        let consensus = Consensus {
+            node_id: node_id.clone(),
+            current_term: current_term.clone(),
+            state: state.clone(),
+            leader_id: leader_id.clone(),
+            command_tx: command_tx.clone(),
+        };
+        
+        // Start consensus loop in the background
+        tokio::spawn(consensus_loop(
+            config,
+            node_id,
+            current_term.clone(),
+            state.clone(),
+            leader_id.clone(),
+            command_rx,
+        ));
+        
+        Ok(consensus)
+    }
+    
+    /// Apply a command to the state machine
+    pub async fn apply(&self, command: Command) -> Result<(), ConsensusError> {
+        let (tx, rx) = oneshot::channel();
+        
+        self.command_tx
+            .send(ConsensusCommand::Apply {
+                command,
+                response: tx,
+            })
+            .await
+            .map_err(|_| {
+                ConsensusError::Internal("Failed to send command".to_string())
+            })?;
+        
+        rx.await.map_err(|_| {
+            ConsensusError::Internal("Failed to receive response".to_string())
+        })?
+    }
+    
+    /// Get current leader
+    pub async fn get_leader(&self) -> Option<String> {
+        let (tx, rx) = oneshot::channel();
+        
+        if let Err(_) = self
+            .command_tx
+            .send(ConsensusCommand::GetLeader { response: tx })
+            .await
+        {
+            return None;
+        }
+        
+        rx.await.unwrap_or(None)
+    }
+    
+    /// Get current term
+    pub async fn get_term(&self) -> u64 {
+        let (tx, rx) = oneshot::channel();
+        
+        if let Err(_) = self
+            .command_tx
+            .send(ConsensusCommand::GetTerm { response: tx })
+            .await
+        {
+            return 0;
+        }
+        
+        rx.await.unwrap_or(0)
+    }
+    
+    /// Get current state
+    pub async fn get_state(&self) -> NodeState {
+        let (tx, rx) = oneshot::channel();
+        
+        if let Err(_) = self
+            .command_tx
+            .send(ConsensusCommand::GetState { response: tx })
+            .await
+        {
+            return NodeState::Follower;
+        }
+        
+        rx.await.unwrap_or(NodeState::Follower)
+    }
+    
+    /// Shutdown the consensus module
+    pub async fn shutdown(&self) {
+        let (tx, rx) = oneshot::channel();
+        
+        if let Err(_) = self
+            .command_tx
+            .send(ConsensusCommand::Shutdown { response: tx })
+            .await
+        {
+            return;
+        }
+        
+        let _ = rx.await;
+    }
+}
+
+// Main consensus loop
+async fn consensus_loop(
+    config: ConsensusConfig,
+    node_id: String,
+    current_term: Arc<RwLock<u64>>,
+    state: Arc<RwLock<NodeState>>,
+    leader_id: Arc<RwLock<Option<String>>>,
+    mut command_rx: mpsc::Receiver<ConsensusCommand>,
+) {
+    // Initialize Raft state
+    let mut voted_for: Option<String> = None;
+    let mut log: Vec<RaftLogEntry> = Vec::new();
+    let mut commit_index: u64 = 0;
+    let mut last_applied: u64 = 0;
+    let mut next_index: HashMap<String, u64> = HashMap::new();
+    let mut match_index: HashMap<String, u64> = HashMap::new();
+    
+    // Initialize peer connections
+    let mut peers: HashMap<String, SocketAddr> = HashMap::new();
+    for (i, addr) in config.peers.iter().enumerate() {
+        peers.insert(format!("peer-{}", i), *addr);
+    }
+    
+    // Set initial election timeout
+    let mut election_timeout = random_election_timeout(config.election_timeout);
+    let mut last_heartbeat = Instant::now();
+    
+    // Main loop
+    loop {
+        // Handle commands
+        while let Ok(command) = command_rx.try_recv() {
+            match command {
+                ConsensusCommand::Apply { command, response } => {
+                    let result = if *state.read().unwrap() == NodeState::Leader {
+                        // Leader can apply commands directly
+                        let entry = RaftLogEntry {
+                            term: *current_term.read().unwrap(),
+                            command,
+                            id: Uuid::new_v4().to_string(),
+                        };
+                        
+                        log.push(entry);
+                        
+                        // TODO: Replicate to followers and wait for majority
+                        
+                        Ok(())
+                    } else {
+                        // Non-leaders redirect to leader
+                        Err(ConsensusError::NotLeader)
+                    };
+                    
+                    let _ = response.send(result);
+                }
+                ConsensusCommand::GetLeader { response } => {
+                    let _ = response.send(leader_id.read().unwrap().clone());
+                }
+                ConsensusCommand::GetTerm { response } => {
+                    let _ = response.send(*current_term.read().unwrap());
+                }
+                ConsensusCommand::GetState { response } => {
+                    let _ = response.send(*state.read().unwrap());
+                }
+                ConsensusCommand::Shutdown { response } => {
+                    let _ = response.send(());
+                    return;
+                }
+            }
+        }
+        
+        // State machine based on Raft
+        match *state.read().unwrap() {
+            NodeState::Follower => {
+                // Check if election timeout has elapsed
+                if last_heartbeat.elapsed() > election_timeout {
+                    // Convert to candidate and start election
+                    *state.write().unwrap() = NodeState::Candidate;
+                    *current_term.write().unwrap() += 1;
+                    voted_for = Some(node_id.clone());
+                    
+                    // Reset election timeout
+                    election_timeout = random_election_timeout(config.election_timeout);
+                    last_heartbeat = Instant::now();
+                    
+                    // TODO: Send RequestVote RPCs to all peers
+                }
+            }
+            NodeState::Candidate => {
+                // Check if election timeout has elapsed
+                if last_heartbeat.elapsed() > election_timeout {
+                    // Start new election round
+                    *current_term.write().unwrap() += 1;
+                    voted_for = Some(node_id.clone());
+                    
+                    // Reset election timeout
+                    election_timeout = random_election_timeout(config.election_timeout);
+                    last_heartbeat = Instant::now();
+                    
+                    // TODO: Send RequestVote RPCs to all peers
+                }
+            }
+            NodeState::Leader => {
+                // Send heartbeats to followers
+                if last_heartbeat.elapsed() > Duration::from_millis(config.heartbeat_interval) {
+                    // Reset heartbeat timer
+                    last_heartbeat = Instant::now();
+                    
+                    // TODO: Send AppendEntries RPCs to all peers
+                }
+            }
+            NodeState::Observer => {
+                // Observers don't participate in leader election
+                // Just check for heartbeats to track leader
+                if last_heartbeat.elapsed() > Duration::from_millis(config.heartbeat_interval * 2) {
+                    // Haven't heard from leader, clear leader ID
+                    *leader_id.write().unwrap() = None;
+                }
+            }
+        }
+        
+        // Sleep briefly to avoid busy-waiting
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+// Generate a random election timeout
+fn random_election_timeout(range: (u64, u64)) -> Duration {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let timeout = rng.gen_range(range.0..=range.1);
+    Duration::from_millis(timeout)
+}
+$$--GLUE--$$
+.\network\mod.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// network/mod.rs - Network module for distributed communication
+
+pub mod consensus;
+pub mod transport;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::sync::{mpsc, Mutex};
+use uuid::Uuid;
+
+use crate::config::{NetworkConfig, NodeConfig};
+use crate::storage::block::LogEntry;
+use self::consensus::{Command, Consensus, ConsensusConfig, ConsensusError, NodeState};
+use self::transport::{Message, Transport, TransportError};
+
+// Network errors
+#[derive(Error, Debug)]
+pub enum NetworkError {
+    #[error("Transport error: {0}")]
+    Transport(#[from] TransportError),
+    
+    #[error("Consensus error: {0}")]
+    Consensus(#[from] ConsensusError),
+    
+    #[error("Not the leader")]
+    NotLeader,
+    
+    #[error("Internal error: {0}")]
+    Internal(String),
+}
+
+// Network service for distributed communication
+#[derive(Debug)]
+pub struct Network {
+    /// Node ID
+    node_id: String,
+    /// Cluster ID
+    cluster_id: String,
+    /// Network transport
+    transport: Arc<Transport>,
+    /// Consensus module
+    consensus: Arc<Consensus>,
+    /// Message receiver
+    message_rx: Arc<Mutex<mpsc::Receiver<Message>>>,
+}
+
+impl Network {
+    /// Create a new network service
+    pub async fn new(
+        node_config: NodeConfig,
+        network_config: NetworkConfig,
+    ) -> Result<Self, NetworkError> {
+        let node_id = node_config.id.clone();
+        let cluster_id = Uuid::new_v4().to_string();
+        
+        // Create consensus module
+        let consensus_config = ConsensusConfig {
+            node: node_config.clone(),
+            peers: network_config.peers.clone(),
+            ..Default::default()
+        };
+        
+        let consensus = Consensus::new(consensus_config).await
+            .map_err(NetworkError::Consensus)?;
+        
+        // Create transport module
+        let transport = Transport::new(node_id.clone(), cluster_id.clone(), network_config.clone())
+            .await
+            .map_err(NetworkError::Transport)?;
+
+        // Get message receiver (take ownership, not a reference)
+        let message_rx = Arc::new(Mutex::new(transport.get_receiver()));
+        
+        // Create network instance
+        let network = Network {
+            node_id,
+            cluster_id,
+            transport: Arc::new(transport),
+            consensus: Arc::new(consensus),
+            message_rx,
+        };
+        
+        // Start message handler
+        let transport_clone = network.transport.clone();
+        let consensus_clone = network.consensus.clone();
+        let message_rx_clone = message_rx.clone();
+
+        tokio::spawn(async move {
+            let mut rx = message_rx_clone.lock().await;
+            while let Some(message) = rx.recv().await {
+                handle_message(
+                    &transport_clone,
+                    &consensus_clone,
+                    message,
+                ).await;
+            }
+        });
+        
+        // Connect to peers
+        for (i, addr) in network_config.peers.iter().enumerate() {
+            let peer_id = format!("peer-{}", i);
+            if let Err(e) = network.transport.connect(&peer_id, *addr).await {
+                log::warn!("Failed to connect to peer {}: {}", peer_id, e);
+            }
+        }
+        
+        Ok(network)
+    }
+    
+    /// Apply a command to the distributed state machine
+    pub async fn apply_command(&self, command: Command) -> Result<(), NetworkError> {
+        // Check if we're the leader
+        if self.consensus.get_state().await != NodeState::Leader {
+            // Forward to leader if known
+            if let Some(leader_id) = self.consensus.get_leader().await {
+                // TODO: Implement forwarding to leader
+                return Err(NetworkError::NotLeader);
+            } else {
+                return Err(NetworkError::NotLeader);
+            }
+        }
+        
+        // Apply command through consensus
+        self.consensus.apply(command).await
+            .map_err(NetworkError::Consensus)
+    }
+    
+    /// Get the current node state
+    pub async fn get_state(&self) -> NodeState {
+        self.consensus.get_state().await
+    }
+    
+    /// Get the current leader ID
+    pub async fn get_leader(&self) -> Option<String> {
+        self.consensus.get_leader().await
+    }
+    
+    /// Shutdown the network service
+    pub async fn shutdown(&self) {
+        self.consensus.shutdown().await;
+        self.transport.shutdown().await;
+    }
+}
+
+// Handle incoming network messages
+async fn handle_message(
+    transport: &Arc<Transport>,
+    consensus: &Arc<Consensus>,
+    message: Message,
+) {
+    match message {
+        Message::Raft(raft_message) => {
+            // Handle Raft consensus messages
+            // TODO: Process raft messages through consensus module
+        }
+        Message::Query { query_id, query_string } => {
+            // Handle direct queries
+            // TODO: Implement query handling
+        }
+        Message::QueryResponse { query_id, success, results, error } => {
+            // Handle query responses
+            // TODO: Implement query response handling
+        }
+        Message::Heartbeat => {
+            // Heartbeat messages are handled by the transport layer
+        }
+        Message::Handshake { node_id, cluster_id, timestamp } => {
+            // Handshake messages are handled by the transport layer
+        }
+    }
+}
+$$--GLUE--$$
+.\network\transport.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// network/transport.rs - Network transport implementation (simplified)
+
+use std::collections::HashMap;
+use std::io;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::timeout;
+
+use crate::config::NetworkConfig;
+use crate::network::consensus::RaftMessage;
+
+// Transport errors
+#[derive(Error, Debug)]
+pub enum TransportError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    
+    #[error("Connection timeout")]
+    Timeout,
+    
+    #[error("Connection closed")]
+    Closed,
+    
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+    
+    #[error("Not connected to peer: {0}")]
+    NotConnected(String),
+    
+    #[error("Internal error: {0}")]
+    Internal(String),
+}
+
+// Message types for network transport
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Message {
+    /// Raft consensus message
+    Raft(RaftMessage),
+    
+    /// Direct query to execute
+    Query {
+        query_id: String,
+        query_string: String,
+    },
+    
+    /// Query response
+    QueryResponse {
+        query_id: String,
+        success: bool,
+        results: Vec<u8>,
+        error: Option<String>,
+    },
+    
+    /// Heartbeat to keep connection alive
+    Heartbeat,
+    
+    /// Handshake message for connection establishment
+    Handshake {
+        node_id: String,
+        cluster_id: String,
+        timestamp: u64,
+    },
+}
+
+// Command types for the transport module
+#[derive(Debug)]
+pub enum TransportCommand {
+    /// Send message to a specific peer
+    Send {
+        peer_id: String,
+        message: Message,
+        response: oneshot::Sender<Result<(), TransportError>>,
+    },
+    
+    /// Broadcast message to all peers
+    Broadcast {
+        message: Message,
+        response: oneshot::Sender<HashMap<String, Result<(), TransportError>>>,
+    },
+    
+    /// Connect to a new peer
+    Connect {
+        peer_id: String,
+        addr: SocketAddr,
+        response: oneshot::Sender<Result<(), TransportError>>,
+    },
+    
+    /// Disconnect from a peer
+    Disconnect {
+        peer_id: String,
+        response: oneshot::Sender<Result<(), TransportError>>,
+    },
+    
+    /// Shutdown the transport
+    Shutdown {
+        response: oneshot::Sender<()>,
+    },
+}
+
+// Peer connection state
+#[derive(Debug)]
+struct PeerConnection {
+    /// Peer ID
+    id: String,
+    /// Peer address
+    addr: SocketAddr,
+    /// Send channel for the connection
+    tx: mpsc::Sender<Message>,
+    /// Last activity timestamp
+    last_activity: Arc<Mutex<std::time::Instant>>,
+}
+
+// Network transport implementation
+#[derive(Debug, Clone)]
+pub struct Transport {
+    /// Node ID
+    node_id: String,
+    /// Cluster ID
+    cluster_id: String,
+    /// Network configuration
+    config: Arc<NetworkConfig>,
+    /// Connected peers
+    peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
+    /// Message sender channel
+    message_tx: mpsc::Sender<Message>,
+    /// Message receiver channel
+    message_rx: mpsc::Receiver<Message>,
+    /// Command channel
+    command_tx: mpsc::Sender<TransportCommand>,
+}
+
+impl Transport {
+    /// Create a new transport instance
+    pub async fn new(
+        node_id: String,
+        cluster_id: String,
+        config: NetworkConfig,
+    ) -> Result<Self, TransportError> {
+        // Create channels
+        let (message_tx, message_rx) = mpsc::channel(1000);
+        let (command_tx, command_rx) = mpsc::channel(100);
+        
+        // Create shared config
+        let config_arc = Arc::new(config);
+        
+        // Create transport instance
+        let transport = Transport {
+            node_id: node_id.clone(),
+            cluster_id: cluster_id.clone(),
+            config: config_arc.clone(),
+            peers: Arc::new(RwLock::new(HashMap::new())),
+            message_tx: message_tx.clone(),
+            command_tx: command_tx.clone(),
+            message_rx,
+        };
+        
+        // Start listener
+        let listener_addr = config_arc.listen_addr;
+        let listener_node_id = node_id.clone();
+        let listener_cluster_id = cluster_id.clone();
+        let listener_peers = transport.peers.clone();
+        let listener_tx = message_tx.clone();
+        
+        let config_arc_listener = config_arc.clone();
+        tokio::spawn(async move {
+            if let Err(e) = listen(
+                listener_addr,
+                listener_node_id,
+                listener_cluster_id,
+                listener_peers,
+                listener_tx,
+                config_arc_listener,
+            ).await {
+                log::error!("Listener error: {}", e);
+            }
+        });
+        
+        // Start command processor
+        let processor_peers = transport.peers.clone();
+        let processor_node_id = node_id.clone();
+        let processor_cluster_id = cluster_id.clone();
+        let processor_config = config_arc.clone();
+        let processor_message_rx = message_rx;
+        
+        tokio::spawn(async move {
+            process_commands(
+                command_rx,
+                processor_message_rx,
+                processor_peers,
+                processor_node_id,
+                processor_cluster_id,
+                processor_config,
+            ).await;
+        });
+        
+        Ok(transport)
+    }
+
+    pub fn get_receiver(&mut self) -> &mut mpsc::Receiver<Message> {
+        &mut self.message_rx
+    }
+    
+    /// Send a message to a specific peer
+    pub async fn send(
+        &self,
+        peer_id: &str,
+        message: Message,
+    ) -> Result<(), TransportError> {
+        let (tx, rx) = oneshot::channel();
+        
+        self.command_tx
+            .send(TransportCommand::Send {
+                peer_id: peer_id.to_string(),
+                message,
+                response: tx,
+            })
+            .await
+            .map_err(|_| {
+                TransportError::Internal("Failed to send command".to_string())
+            })?;
+        
+        rx.await.map_err(|_| {
+            TransportError::Internal("Failed to receive response".to_string())
+        })?
+    }
+    
+    /// Broadcast a message to all peers
+    pub async fn broadcast(
+        &self,
+        message: Message,
+    ) -> HashMap<String, Result<(), TransportError>> {
+        let (tx, rx) = oneshot::channel();
+        
+        if let Err(_) = self
+            .command_tx
+            .send(TransportCommand::Broadcast {
+                message,
+                response: tx,
+            })
+            .await
+        {
+            return HashMap::new();
+        }
+        
+        rx.await.unwrap_or_default()
+    }
+    
+    /// Connect to a new peer
+    pub async fn connect(
+        &self,
+        peer_id: &str,
+        addr: SocketAddr,
+    ) -> Result<(), TransportError> {
+        let (tx, rx) = oneshot::channel();
+        
+        self.command_tx
+            .send(TransportCommand::Connect {
+                peer_id: peer_id.to_string(),
+                addr,
+                response: tx,
+            })
+            .await
+            .map_err(|_| {
+                TransportError::Internal("Failed to send command".to_string())
+            })?;
+        
+        rx.await.map_err(|_| {
+            TransportError::Internal("Failed to receive response".to_string())
+        })?
+    }
+    
+    /// Disconnect from a peer
+    pub async fn disconnect(&self, peer_id: &str) -> Result<(), TransportError> {
+        let (tx, rx) = oneshot::channel();
+        
+        self.command_tx
+            .send(TransportCommand::Disconnect {
+                peer_id: peer_id.to_string(),
+                response: tx,
+            })
+            .await
+            .map_err(|_| {
+                TransportError::Internal("Failed to send command".to_string())
+            })?;
+        
+        rx.await.map_err(|_| {
+            TransportError::Internal("Failed to receive response".to_string())
+        })?
+    }
+    
+    /// Shutdown the transport
+    pub async fn shutdown(&self) {
+        let (tx, rx) = oneshot::channel();
+        
+        if let Err(_) = self
+            .command_tx
+            .send(TransportCommand::Shutdown { response: tx })
+            .await
+        {
+            return;
+        }
+        
+        let _ = rx.await;
+    }
+}
+
+// Listen for incoming connections
+async fn listen(
+    addr: SocketAddr,
+    node_id: String,
+    cluster_id: String,
+    peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
+    tx: mpsc::Sender<Message>,
+    config: Arc<NetworkConfig>,
+) -> Result<(), TransportError> {
+    // Bind to the listen address
+    let listener = TcpListener::bind(addr).await?;
+    log::info!("Listening on {}", addr);
+    
+    // Accept connections
+    while let Ok((stream, peer_addr)) = listener.accept().await {
+        log::debug!("Accepted connection from {}", peer_addr);
+        
+        // Set TCP options
+        if let Err(e) = stream.set_nodelay(true) {
+            log::warn!("Failed to set TCP_NODELAY: {}", e);
+        }
+        
+        // Handle the connection in a separate task
+        let node_id = node_id.clone();
+        let cluster_id = cluster_id.clone();
+        let peers = peers.clone();
+        let tx = tx.clone();
+        let config = config.clone();
+        
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(
+                stream,
+                peer_addr,
+                node_id,
+                cluster_id,
+                peers,
+                tx,
+                config,
+            ).await {
+                log::error!("Connection error for {}: {}", peer_addr, e);
+            }
+        });
+    }
+    
+    Ok(())
+}
+
+// Handle a single connection
+// Handle a single connection
+async fn handle_connection(
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    node_id: String,
+    cluster_id: String,
+    peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
+    tx: mpsc::Sender<Message>,
+    config: Arc<NetworkConfig>,
+) -> Result<(), TransportError> {
+    // Split the stream into read and write halves
+    let (mut read_half, mut write_half) = tokio::io::split(stream);
+    
+    // Send handshake
+    let handshake = Message::Handshake {
+        node_id: node_id.clone(),
+        cluster_id: cluster_id.clone(),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    };
+    
+    // Serialize the handshake message
+    let bytes = bincode::serialize(&handshake).map_err(|e| {
+        TransportError::Serialization(e.to_string())
+    })?;
+    
+    // Write message length and data
+    let len = bytes.len() as u32;
+    write_half.write_all(&len.to_be_bytes()).await?;
+    write_half.write_all(&bytes).await?;
+    write_half.flush().await?;
+    
+    // Receive handshake
+    let peer_handshake = match timeout(Duration::from_secs(5), read_message(&mut read_half)).await {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(TransportError::Timeout),
+    };
+    
+    let peer_id = match peer_handshake {
+        Message::Handshake {
+            node_id,
+            cluster_id: peer_cluster_id,
+            timestamp: _,
+        } => {
+            // Verify cluster ID
+            if peer_cluster_id != cluster_id {
+                log::warn!(
+                    "Peer {} has different cluster ID: {} (expected {})",
+                    peer_addr,
+                    peer_cluster_id,
+                    cluster_id
+                );
+                return Err(TransportError::Internal(
+                    "Cluster ID mismatch".to_string(),
+                ));
+            }
+            
+            node_id
+        }
+        _ => {
+            return Err(TransportError::Internal(
+                "Invalid handshake message".to_string(),
+            ));
+        }
+    };
+    
+    log::info!("Established connection with peer {} ({})", peer_id, peer_addr);
+    
+    // Create message channel for this peer
+    let (peer_tx, mut peer_rx) = mpsc::channel::<Message>(100);
+    
+    // Add peer to the connection map
+    let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
+    let peer_conn = PeerConnection {
+        id: peer_id.clone(),
+        addr: peer_addr,
+        tx: peer_tx.clone(),
+        last_activity: last_activity.clone(),
+    };
+    
+    peers.write().unwrap().insert(peer_id.clone(), peer_conn);
+    
+    // Spawn writer task
+    let writer_last_activity = last_activity.clone();
+    tokio::spawn(async move {
+        while let Some(message) = peer_rx.recv().await {
+            // Serialize the message
+            let bytes = match bincode::serialize(&message) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    log::error!("Failed to serialize message: {}", e);
+                    continue;
+                }
+            };
+            
+            // Write message length and data
+            let len = bytes.len() as u32;
+            if let Err(e) = write_half.write_all(&len.to_be_bytes()).await {
+                log::error!("Failed to write message length: {}", e);
+                break;
+            }
+            
+            if let Err(e) = write_half.write_all(&bytes).await {
+                log::error!("Failed to write message data: {}", e);
+                break;
+            }
+            
+            if let Err(e) = write_half.flush().await {
+                log::error!("Failed to flush message: {}", e);
+                break;
+            }
+            
+            // Update last activity
+            *writer_last_activity.lock().unwrap() = std::time::Instant::now();
+        }
+    });
+    
+    // Reader loop
+    loop {
+        // Read message with timeout
+        let message = match timeout(
+            Duration::from_secs(config.timeout.as_secs() * 2),
+            read_message::<Message, _>(&mut read_half),
+        ).await {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(e)) => {
+                log::error!("Error reading message from peer {}: {}", peer_id, e);
+                break;
+            }
+            Err(_) => {
+                log::warn!("Connection timeout for peer {}", peer_id);
+                break;
+            }
+        };
+        
+        // Update last activity
+        *last_activity.lock().unwrap() = std::time::Instant::now();
+        
+        // Handle message
+        match &message {
+            Message::Heartbeat => {
+                // Respond with heartbeat
+                if let Err(e) = peer_tx.send(Message::Heartbeat).await {
+                    log::error!("Failed to send heartbeat to peer {}: {}", peer_id, e);
+                    break;
+                }
+            }
+            _ => {
+                // Forward message to handler
+                if let Err(e) = tx.send(message).await {
+                    log::error!("Failed to forward message: {}", e);
+                    break;
+                }
+            }
+        }
+    }
+    
+    // Remove peer from the connection map
+    peers.write().unwrap().remove(&peer_id);
+    log::info!("Disconnected from peer {} ({})", peer_id, peer_addr);
+    
+    Ok(())
+}
+
+// Process transport commands
+async fn process_commands(
+    mut command_rx: mpsc::Receiver<TransportCommand>,
+    mut _message_rx: mpsc::Receiver<Message>,
+    peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
+    node_id: String,
+    cluster_id: String,
+    config: Arc<NetworkConfig>,
+) {
+    while let Some(command) = command_rx.recv().await {
+        match command {
+            TransportCommand::Send {
+                peer_id,
+                message,
+                response,
+            } => {
+                let result = send_to_peer(&peers, &peer_id, message).await;
+                let _ = response.send(result);
+            }
+            TransportCommand::Broadcast { message, response } => {
+                let mut results = HashMap::new();
+                let peer_ids: Vec<String> = {
+                    peers.read().unwrap().keys().cloned().collect()
+                };
+                
+                for peer_id in peer_ids {
+                    let result = send_to_peer(&peers, &peer_id, message.clone()).await;
+                    results.insert(peer_id, result);
+                }
+                
+                let _ = response.send(results);
+            }
+            TransportCommand::Connect {
+                peer_id,
+                addr,
+                response,
+            } => {
+                let result = connect_to_peer(
+                    &peers,
+                    peer_id.clone(),
+                    addr,
+                    node_id.clone(),
+                    cluster_id.clone(),
+                    config.clone(),
+                ).await;
+                let _ = response.send(result);
+            }
+            TransportCommand::Disconnect { peer_id, response } => {
+                let mut peers_write = peers.write().unwrap();
+                peers_write.remove(&peer_id);
+                let _ = response.send(Ok(()));
+            }
+            TransportCommand::Shutdown { response } => {
+                // Close all connections
+                peers.write().unwrap().clear();
+                let _ = response.send(());
+                break;
+            }
+        }
+    }
+}
+
+// Send a message to a specific peer
+async fn send_to_peer(
+    peers: &Arc<RwLock<HashMap<String, PeerConnection>>>,
+    peer_id: &str,
+    message: Message,
+) -> Result<(), TransportError> {
+    let tx = {
+        let peers_read = peers.read().unwrap();
+        match peers_read.get(peer_id) {
+            Some(peer) => peer.tx.clone(),
+            None => return Err(TransportError::NotConnected(peer_id.to_string())),
+        }
+    };
+    
+    tx.send(message).await.map_err(|_| {
+        TransportError::Closed
+    })
+}
+
+// Connect to a peer
+async fn connect_to_peer(
+    peers: &Arc<RwLock<HashMap<String, PeerConnection>>>,
+    peer_id: String,
+    addr: SocketAddr,
+    node_id: String,
+    cluster_id: String,
+    config: Arc<NetworkConfig>,
+) -> Result<(), TransportError> {
+    // Check if already connected
+    {
+        let peers_read = peers.read().unwrap();
+        if peers_read.contains_key(&peer_id) {
+            return Ok(());
+        }
+    }
+    
+    // Connect to peer
+    let mut stream = match timeout(
+        config.timeout,
+        TcpStream::connect(addr),
+    ).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => return Err(TransportError::Io(e)),
+        Err(_) => return Err(TransportError::Timeout),
+    };
+    
+    // Set TCP options
+    if let Err(e) = stream.set_nodelay(true) {
+        log::warn!("Failed to set TCP_NODELAY: {}", e);
+    }
+    
+    // Send handshake
+    let handshake = Message::Handshake {
+        node_id: node_id.clone(),
+        cluster_id: cluster_id.clone(),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    };
+    
+    // Serialize and send handshake
+    let bytes = bincode::serialize(&handshake).map_err(|e| {
+        TransportError::Serialization(e.to_string())
+    })?;
+    
+    
+    // Write message length and data
+    let len = bytes.len() as u32;
+    stream.write_all(&len.to_be_bytes()).await?;
+    stream.write_all(&bytes).await?;
+    stream.flush().await?;
+    
+    // Receive handshake
+    let peer_handshake = match timeout(
+        Duration::from_secs(5),
+        read_message::<Message, _>(&mut stream),
+    ).await {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(TransportError::Timeout),
+    };
+    
+    let verified_peer_id = match peer_handshake {
+        Message::Handshake {
+            node_id,
+            cluster_id: peer_cluster_id,
+            timestamp: _,
+        } => {
+            // Verify cluster ID
+            if peer_cluster_id != cluster_id {
+                log::warn!(
+                    "Peer {} has different cluster ID: {} (expected {})",
+                    addr,
+                    peer_cluster_id,
+                    cluster_id
+                );
+                return Err(TransportError::Internal(
+                    "Cluster ID mismatch".to_string(),
+                ));
+            }
+            
+            // Verify node ID
+            if node_id != peer_id {
+                log::warn!(
+                    "Peer {} has different node ID: {} (expected {})",
+                    addr,
+                    node_id,
+                    peer_id
+                );
+                return Err(TransportError::Internal(
+                    "Node ID mismatch".to_string(),
+                ));
+            }
+            
+            node_id
+        }
+        _ => {
+            return Err(TransportError::Internal(
+                "Invalid handshake message".to_string(),
+            ));
+        }
+    };
+    
+    log::info!("Connected to peer {} ({})", verified_peer_id, addr);
+    
+    // Create message channel for this peer
+    let (peer_tx, _peer_rx) = mpsc::channel::<Message>(100);
+    
+    // Add peer to the connection map
+    let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
+    let peer_conn = PeerConnection {
+        id: verified_peer_id.clone(),
+        addr,
+        tx: peer_tx,
+        last_activity,
+    };
+    
+    peers.write().unwrap().insert(verified_peer_id.clone(), peer_conn);
+    
+    // Note: We're not starting reader and writer tasks here since that would be
+    // handled by the listener when the peer connects back to us
+    
+    Ok(())
+}
+
+// Read a message from a stream
+use tokio::io::AsyncRead;
+
+async fn read_message<T, R>(
+    reader: &mut R,
+) -> Result<T, TransportError>
+where
+    T: for<'de> Deserialize<'de>,
+    R: AsyncRead + Unpin,
+{
+    // Read message length
+    let mut len_bytes = [0u8; 4];
+    reader.read_exact(&mut len_bytes).await?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    
+    // Read message data
+    let mut buffer = vec![0u8; len];
+    reader.read_exact(&mut buffer).await?;
+    
+    // Deserialize the message
+    bincode::deserialize(&buffer).map_err(|e| {
+        TransportError::Serialization(e.to_string())
+    })
+}
+$$--GLUE--$$
+.\query\engine.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// query/engine.rs - Query execution engine (simplified)
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+use crate::config::QueryConfig;
+use crate::storage::{Error as StorageError, Storage};
+use crate::storage::block::LogEntry;
+
+// Query engine errors
+#[derive(Error, Debug)]
+pub enum QueryError {
+    #[error("Storage error: {0}")]
+    Storage(#[from] StorageError),
+    
+    #[error("Timeout")]
+    Timeout,
+    
+    #[error("Query canceled")]
+    Canceled,
+    
+    #[error("Invalid partition: {0}")]
+    InvalidPartition(String),
+    
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(String),
+    
+    #[error("Internal error: {0}")]
+    Internal(String),
+}
+
+// Query result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryResult {
+    /// Query execution ID
+    pub id: String,
+    /// Query execution time
+    pub execution_time: Duration,
+    /// Number of entries scanned
+    pub scanned_entries: u64,
+    /// Number of matches
+    pub matched_entries: u64,
+    /// Result entries
+    pub entries: Vec<LogEntry>,
+    /// Error message, if any
+    pub error: Option<String>,
+}
+
+// Query execution status
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QueryStatus {
+    /// Query is running
+    Running,
+    /// Query completed successfully
+    Completed,
+    /// Query failed
+    Failed,
+    /// Query was canceled
+    Canceled,
+}
+
+// Query execution statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryStatistics {
+    /// Query ID
+    pub id: String,
+    /// Query string
+    pub query_string: String,
+    /// Query status
+    pub status: QueryStatus,
+    /// Start time
+    pub start_time: DateTime<Utc>,
+    /// End time
+    pub end_time: Option<DateTime<Utc>>,
+    /// Execution time
+    pub execution_time: Option<Duration>,
+    /// Number of entries scanned
+    pub scanned_entries: u64,
+    /// Number of matches
+    pub matched_entries: u64,
+    /// Error message, if any
+    pub error: Option<String>,
+}
+
+// Simple filter for logs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogFilter {
+    /// Optional time range (start, end)
+    pub time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// Optional source filter
+    pub source: Option<String>,
+    /// Optional tag filters (key/value pairs)
+    pub tags: HashMap<String, String>,
+    /// Optional message contains filter
+    pub message_contains: Option<String>,
+    /// Maximum number of results
+    pub limit: Option<usize>,
+}
+
+// Query engine command
+enum QueryCommand {
+    /// Execute a query
+    Execute {
+        query_id: String,
+        filter: LogFilter,
+        response: mpsc::Sender<Result<QueryResult, QueryError>>,
+    },
+    /// Cancel a running query
+    Cancel {
+        query_id: String,
+        response: mpsc::Sender<Result<(), QueryError>>,
+    },
+    /// Get statistics for a query
+    GetStatistics {
+        query_id: String,
+        response: mpsc::Sender<Result<QueryStatistics, QueryError>>,
+    },
+    /// Shutdown the query engine
+    Shutdown {
+        response: mpsc::Sender<()>,
+    },
+}
+
+// Query engine
+#[derive(Debug)]
+pub struct QueryEngine {
+    /// Storage manager
+    storage: Arc<Storage>,
+    /// Query configuration
+    config: QueryConfig,
+    /// Query statistics
+    statistics: Arc<Mutex<HashMap<String, QueryStatistics>>>,
+    /// Active queries
+    active_queries: Arc<Mutex<HashMap<String, mpsc::Sender<()>>>>,
+    /// Command channel
+    command_tx: mpsc::Sender<QueryCommand>,
+}
+
+impl QueryEngine {
+    /// Create a new query engine
+    pub fn new(storage: Arc<Storage>, config: QueryConfig) -> Self {
+        // Create channels
+        let (command_tx, command_rx) = mpsc::channel(100);
+        
+        // Create statistics map
+        let statistics = Arc::new(Mutex::new(HashMap::new()));
+        
+        // Create active queries map
+        let active_queries = Arc::new(Mutex::new(HashMap::new()));
+        
+        // Create query engine
+        let engine = QueryEngine {
+            storage,
+            config,
+            statistics,
+            active_queries,
+            command_tx,
+        };
+        
+        // Start command processor
+        let processor_storage = engine.storage.clone();
+        let processor_config = engine.config.clone();
+        let processor_statistics = engine.statistics.clone();
+        let processor_active_queries = engine.active_queries.clone();
+        
+        tokio::spawn(async move {
+            process_commands(
+                command_rx,
+                processor_storage,
+                processor_config,
+                processor_statistics,
+                processor_active_queries,
+            ).await;
+        });
+        
+        engine
+    }
+    
+    /// Execute a query with a filter
+    pub async fn execute(&self, filter: LogFilter) -> Result<QueryResult, QueryError> {
+        let query_id = Uuid::new_v4().to_string();
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        
+        // Send command
+        self.command_tx
+            .send(QueryCommand::Execute {
+                query_id: query_id.clone(),
+                filter,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| {
+                QueryError::Internal("Failed to send command".to_string())
+            })?;
+        
+        // Wait for response
+        response_rx.recv().await.ok_or_else(|| {
+            QueryError::Internal("Failed to receive response".to_string())
+        })?
+    }
+    
+    /// Cancel a running query
+    pub async fn cancel(&self, query_id: &str) -> Result<(), QueryError> {
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        
+        // Send command
+        self.command_tx
+            .send(QueryCommand::Cancel {
+                query_id: query_id.to_string(),
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| {
+                QueryError::Internal("Failed to send command".to_string())
+            })?;
+        
+        // Wait for response
+        response_rx.recv().await.ok_or_else(|| {
+            QueryError::Internal("Failed to receive response".to_string())
+        })?
+    }
+    
+    /// Get statistics for a query
+    pub async fn get_statistics(&self, query_id: &str) -> Result<QueryStatistics, QueryError> {
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        
+        // Send command
+        self.command_tx
+            .send(QueryCommand::GetStatistics {
+                query_id: query_id.to_string(),
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| {
+                QueryError::Internal("Failed to send command".to_string())
+            })?;
+        
+        // Wait for response
+        response_rx.recv().await.ok_or_else(|| {
+            QueryError::Internal("Failed to receive response".to_string())
+        })?
+    }
+    
+    /// Shutdown the query engine
+    pub async fn shutdown(&self) {
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        
+        // Send command
+        if let Err(_) = self
+            .command_tx
+            .send(QueryCommand::Shutdown { response: response_tx })
+            .await
+        {
+            return;
+        }
+        
+        // Wait for response
+        let _ = response_rx.recv().await;
+    }
+}
+
+// Process commands
+async fn process_commands(
+    mut command_rx: mpsc::Receiver<QueryCommand>,
+    storage: Arc<Storage>,
+    config: QueryConfig,
+    statistics: Arc<Mutex<HashMap<String, QueryStatistics>>>,
+    active_queries: Arc<Mutex<HashMap<String, mpsc::Sender<()>>>>,
+) {
+    while let Some(command) = command_rx.recv().await {
+        match command {
+            QueryCommand::Execute {
+                query_id,
+                filter,
+                response,
+            } => {
+                // Create cancel channel
+                let (cancel_tx, cancel_rx) = mpsc::channel(1);
+                
+                // Register active query
+                {
+                    let mut active = active_queries.lock().unwrap();
+                    active.insert(query_id.clone(), cancel_tx);
+                }
+                
+                // Update statistics
+                {
+                    let mut stats = statistics.lock().unwrap();
+                    stats.insert(
+                        query_id.clone(),
+                        QueryStatistics {
+                            id: query_id.clone(),
+                            query_string: format!("{:?}", filter),
+                            status: QueryStatus::Running,
+                            start_time: Utc::now(),
+                            end_time: None,
+                            execution_time: None,
+                            scanned_entries: 0,
+                            matched_entries: 0,
+                            error: None,
+                        },
+                    );
+                }
+                
+                // Create executor
+                let mut executor = QueryExecutor {
+                    id: query_id.clone(),
+                    filter,
+                    storage: storage.clone(),
+                    config: config.clone(),
+                    timeout: config.timeout,
+                    max_results: config.max_results,
+                    statistics: statistics.clone(),
+                    cancel_rx,
+                };
+                
+                // Execute the query
+                let active_queries_clone = active_queries.clone();
+                tokio::spawn(async move {
+                    let result = executor.execute().await;
+                    
+                    // Remove from active queries
+                    {
+                        let mut active = active_queries_clone.lock().unwrap();
+                        active.remove(&query_id);
+                    }
+                    
+                    // Send response
+                    let _ = response.send(result).await;
+                });
+            }
+            QueryCommand::Cancel { query_id, response } => {
+                let mut result = Ok(());
+
+                // Extract the sender outside the lock scope
+                let tx_opt = {
+                    let active = active_queries.lock().unwrap();
+                    active.get(&query_id).cloned()
+                };
+
+                if let Some(mut tx) = tx_opt {
+                    if tx.send(()).await.is_err() {
+                        result = Err(QueryError::Internal(
+                            "Failed to send cancel signal".to_string(),
+                        ));
+                    }
+                } else {
+                    result = Err(QueryError::Internal(
+                        format!("Query not found: {}", query_id),
+                    ));
+                }
+
+                // Update statistics
+                if result.is_ok() {
+                    let mut stats = statistics.lock().unwrap();
+                    if let Some(stat) = stats.get_mut(&query_id) {
+                        stat.status = QueryStatus::Canceled;
+                        stat.end_time = Some(Utc::now());
+
+                        if stat.start_time < Utc::now() {
+                            let duration = Utc::now() - stat.start_time;
+                            stat.execution_time = Some(Duration::from_secs(
+                                duration.num_seconds() as u64
+                            ));
+                        }
+                    }
+                }
+
+                // Send response
+                let _ = response.send(result).await;
+            }
+            QueryCommand::GetStatistics { query_id, response } => {
+                let result = {
+                    let stats = statistics.lock().unwrap();
+                    stats.get(&query_id).cloned().ok_or_else(|| {
+                        QueryError::Internal(format!("Statistics not found: {}", query_id))
+                    })
+                };
+                
+                // Send response
+                let _ = response.send(result).await;
+            }
+            QueryCommand::Shutdown { response } => {
+                // Cancel all active queries
+                // Collect all senders first to avoid holding the lock across await
+                let txs: Vec<mpsc::Sender<()>> = {
+                    let active = active_queries.lock().unwrap();
+                    active.values().cloned().collect()
+                };
+                for tx in txs {
+                    let _ = tx.send(()).await;
+                }
+                
+                // Clear active queries
+                {
+                    let mut active = active_queries.lock().unwrap();
+                    active.clear();
+                }
+                
+                // Send response
+                let _ = response.send(()).await;
+                
+                // Break the loop
+                break;
+            }
+        }
+    }
+}
+
+// Query executor
+struct QueryExecutor {
+    /// Query ID
+    id: String,
+    /// Filter
+    filter: LogFilter,
+    /// Storage engine
+    storage: Arc<Storage>,
+    /// Query configuration
+    config: QueryConfig,
+    /// Query timeout
+    timeout: Duration,
+    /// Maximum number of results
+    max_results: usize,
+    /// Query statistics
+    statistics: Arc<Mutex<HashMap<String, QueryStatistics>>>,
+    /// Cancel receiver
+    cancel_rx: mpsc::Receiver<()>,
+}
+
+impl QueryExecutor {
+    /// Execute the query
+    async fn execute(&mut self) -> Result<QueryResult, QueryError> {
+        // Record start time
+        let start_time = Instant::now();
+
+        // Extract timeout and cancel_rx before select to avoid borrowing self
+        let timeout = self.timeout;
+        let cancel_rx = &mut self.cancel_rx;
+
+        // Move a clone of the filter and other needed fields if necessary
+        let filter = self.filter.clone();
+        let storage = self.storage.clone();
+        let config = self.config.clone();
+        let max_results = self.max_results;
+        let id = self.id.clone();
+        let statistics = self.statistics.clone();
+
+        let internal_future = async move {
+            // Reconstruct a QueryExecutor with only immutable borrows
+            let executor = QueryExecutor {
+                id,
+                filter,
+                storage,
+                config,
+                timeout,
+                max_results,
+                statistics,
+                // cancel_rx is not used in execute_internal
+                cancel_rx: mpsc::channel(1).1, // dummy receiver, won't be used
+            };
+            executor.execute_internal().await
+        };
+
+        let result = tokio::select! {
+            result = internal_future => result,
+            _ = tokio::time::sleep(timeout) => {
+                Err(QueryError::Timeout)
+            },
+            _ = cancel_rx.recv() => {
+                Err(QueryError::Canceled)
+            }
+        };
+        
+        // Record end time
+        let execution_time = start_time.elapsed();
+        
+        // Update statistics
+        {
+            let mut stats = self.statistics.lock().unwrap();
+            if let Some(stat) = stats.get_mut(&self.id) {
+                stat.end_time = Some(Utc::now());
+                stat.execution_time = Some(execution_time);
+                
+                match &result {
+                    Ok(res) => {
+                        stat.status = QueryStatus::Completed;
+                        stat.scanned_entries = res.scanned_entries;
+                        stat.matched_entries = res.matched_entries;
+                    }
+                    Err(e) => {
+                        match e {
+                            QueryError::Timeout => {
+                                stat.status = QueryStatus::Failed;
+                                stat.error = Some("Query timed out".to_string());
+                            }
+                            QueryError::Canceled => {
+                                stat.status = QueryStatus::Canceled;
+                                stat.error = Some("Query canceled".to_string());
+                            }
+                            _ => {
+                                stat.status = QueryStatus::Failed;
+                                stat.error = Some(e.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        match result {
+            Ok(mut result) => {
+                // Set the correct execution time
+                result.execution_time = execution_time;
+                Ok(result)
+            }
+            Err(e) => Err(e),
+        }
+    }
+    
+    /// Internal query execution implementation
+    async fn execute_internal(&self) -> Result<QueryResult, QueryError> {
+        // List partitions
+        let partitions = self.storage.list_partitions();
+        
+        // Collect and evaluate entries
+        let mut entries = Vec::new();
+        let mut scanned_entries = 0u64;
+        let mut matched_entries = 0u64;
+        
+        // Process each partition
+        for partition in partitions {
+            // Filter by time range if specified
+            if let Some((_start, _end)) = &self.filter.time_range {
+                // Skip partitions outside the time range
+                // This is a simplification - in a real implementation, we would use
+                // the partition metadata to determine if it could contain matching entries
+            }
+            
+            // Scan all blocks in the partition
+            for block_id in &partition.blocks {
+                // Read entries from block
+                for entry_id in 0..10000 {  // Limit to avoid scanning forever
+                    // Check if reached maximum results
+                    if entries.len() >= self.max_results {
+                        break;
+                    }
+                    
+                    // Try to read entry
+                    let entry = match self.storage.read_entry(&partition.id, block_id, entry_id) {
+                        Ok(entry) => entry,
+                        Err(_) => break, // End of block
+                    };
+                    
+                    scanned_entries += 1;
+                    
+                    // Apply filters
+                    if self.matches_filter(&entry) {
+                        entries.push(entry);
+                        matched_entries += 1;
+                    }
+                }
+            }
+        }
+        
+        // Apply limit
+        if let Some(limit) = self.filter.limit {
+            entries.truncate(limit);
+        }
+        
+        // Create result
+        let result = QueryResult {
+            id: self.id.clone(),
+            execution_time: Default::default(), // Will be set by caller
+            scanned_entries,
+            matched_entries,
+            entries,
+            error: None,
+        };
+        
+        Ok(result)
+    }
+    
+    /// Check if an entry matches the filter
+    fn matches_filter(&self, entry: &LogEntry) -> bool {
+        // Check time range filter
+        if let Some((start, end)) = &self.filter.time_range {
+            if entry.timestamp < *start || entry.timestamp > *end {
+                return false;
+            }
+        }
+        
+        // Check source filter
+        if let Some(source) = &self.filter.source {
+            if entry.source != *source {
+                return false;
+            }
+        }
+        
+        // Check tag filters
+        for (key, value) in &self.filter.tags {
+            if !entry.tags.contains_key(key) || entry.tags.get(key).unwrap() != value {
+                return false;
+            }
+        }
+        
+        // Check message contains filter
+        if let Some(contains) = &self.filter.message_contains {
+            if !entry.message.contains(contains) {
+                return false;
+            }
+        }
+        
+        true
+    }
+}
+$$--GLUE--$$
+.\query\mod.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// query/mod.rs - Query module for search and filtering
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::config::QueryConfig;
+use crate::storage::Storage;
+use self::engine::{QueryEngine, QueryError, QueryResult, QueryStatistics, LogFilter};
+
+// Public API exports
+pub mod engine;
+
+// Query interface for TimberDB
+#[derive(Debug)]
+pub struct Query {
+    /// Query engine
+    engine: Arc<QueryEngine>,
+}
+
+impl Query {
+    /// Create a new query interface
+    pub fn new(storage: Arc<Storage>, config: QueryConfig) -> Self {
+        let engine = QueryEngine::new(storage, config);
+        
+        Query {
+            engine: Arc::new(engine),
+        }
+    }
+    
+    /// Execute a query using a filter
+    pub async fn execute(&self, filter: LogFilter) -> Result<QueryResult, QueryError> {
+        self.engine.execute(filter).await
+    }
+    
+    /// Cancel a running query
+    pub async fn cancel(&self, query_id: &str) -> Result<(), QueryError> {
+        self.engine.cancel(query_id).await
+    }
+    
+    /// Get statistics for a query
+    pub async fn get_statistics(&self, query_id: &str) -> Result<QueryStatistics, QueryError> {
+        self.engine.get_statistics(query_id).await
+    }
+    
+    /// Get the query engine
+    pub fn engine(&self) -> Arc<QueryEngine> {
+        self.engine.clone()
+    }
+    
+    /// Shutdown the query interface
+    pub async fn shutdown(&self) {
+        self.engine.shutdown().await;
+    }
+}
+$$--GLUE--$$
+.\query\parser.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// query/parser.rs - Query language parser
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use nom::{
+    IResult,
+    branch::alt,
+    bytes::complete::{tag, tag_no_case, take_until, take_while, take_while1},
+    character::complete::{char, digit1, multispace0, multispace1},
+    combinator::{map, map_res, opt, recognize, value},
+    multi::{many0, many1, separated_list0, separated_list1},
+    sequence::{delimited, pair, preceded, terminated, tuple},
+};
+use thiserror::Error;
+
+use crate::storage::block::LogEntry;
+
+// Query parser errors
+#[derive(Error, Debug)]
+pub enum ParseError {
+    #[error("Syntax error: {0}")]
+    Syntax(String),
+    
+    #[error("Invalid field: {0}")]
+    InvalidField(String),
+    
+    #[error("Invalid value: {0}")]
+    InvalidValue(String),
+    
+    #[error("Invalid operator: {0}")]
+    InvalidOperator(String),
+    
+    #[error("Invalid date format: {0}")]
+    InvalidDate(String),
+}
+
+// Comparison operators
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComparisonOperator {
+    Equal,
+    NotEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+    Like,
+    NotLike,
+    In,
+    NotIn,
+    Contains,
+    NotContains,
+    StartsWith,
+    EndsWith,
+}
+
+// Logical operators
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogicalOperator {
+    And,
+    Or,
+}
+
+// Query expression
+#[derive(Debug, Clone)]
+pub enum Expression {
+    Comparison {
+        field: String,
+        operator: ComparisonOperator,
+        value: Value,
+    },
+    Logical {
+        operator: LogicalOperator,
+        expressions: Vec<Expression>,
+    },
+    Grouped(Box<Expression>),
+    None,
+}
+
+// Query value types
+#[derive(Debug, Clone)]
+pub enum Value {
+    String(String),
+    Number(f64),
+    Boolean(bool),
+    DateTime(DateTime<Utc>),
+    Duration(Duration),
+    Array(Vec<Value>),
+    Null,
+}
+
+// Query order direction
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderDirection {
+    Asc,
+    Desc,
+}
+
+// Query order by clause
+#[derive(Debug, Clone)]
+pub struct OrderBy {
+    pub field: String,
+    pub direction: OrderDirection,
+}
+
+// Parsed query
+#[derive(Debug, Clone)]
+pub struct Query {
+    pub partitions: Vec<String>,
+    pub time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    pub filter: Expression,
+    pub limit: Option<usize>,
+    pub order_by: Vec<OrderBy>,
+    pub fields: Option<Vec<String>>,
+}
+
+impl Default for Query {
+    fn default() -> Self {
+        Query {
+            partitions: Vec::new(),
+            time_range: None,
+            filter: Expression::None,
+            limit: None,
+            order_by: Vec::new(),
+            fields: None,
+        }
+    }
+}
+
+// Parse a query string into a Query object
+pub fn parse_query(input: &str) -> Result<Query, ParseError> {
+    match query_parser(input) {
+        Ok((_, query)) => Ok(query),
+        Err(e) => Err(ParseError::Syntax(format!("{:?}", e))),
+    }
+}
+
+// Main query parser
+fn query_parser(input: &str) -> IResult<&str, Query> {
+    let (input, _) = multispace0(input)?;
+    let (input, _) = tag_no_case("select")(input)?;
+    let (input, _) = multispace1(input)?;
+    
+    // Parse SELECT fields
+    let (input, fields) = alt((
+        map(tag("*"), |_| None),
+        map(field_list, Some),
+    ))(input)?;
+    
+    // Parse FROM clause
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("from")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, partitions) = partition_list(input)?;
+    
+    // Parse WHERE clause (optional)
+    let (input, filter) = opt(preceded(
+        pair(multispace1, tag_no_case("where")),
+        preceded(multispace1, expression),
+    ))(input)?;
+    
+    // Parse TIME RANGE clause (optional)
+    let (input, time_range) = opt(preceded(
+        pair(multispace1, tag_no_case("time")),
+        preceded(
+            multispace1,
+            time_range_parser,
+        ),
+    ))(input)?;
+    
+    // Parse ORDER BY clause (optional)
+    let (input, order_by) = opt(preceded(
+        pair(multispace1, tag_no_case("order")),
+        preceded(
+            pair(multispace1, tag_no_case("by")),
+            preceded(multispace1, order_by_list),
+        ),
+    ))(input)?;
+    
+    // Parse LIMIT clause (optional)
+    let (input, limit) = opt(preceded(
+        pair(multispace1, tag_no_case("limit")),
+        preceded(multispace1, map_res(digit1, |s: &str| s.parse::<usize>())),
+    ))(input)?;
+    
+    // Create the query object
+    let query = Query {
+        partitions,
+        time_range,
+        filter: filter.unwrap_or(Expression::None),
+        limit,
+        order_by: order_by.unwrap_or_else(Vec::new),
+        fields,
+    };
+    
+    Ok((input, query))
+}
+
+// Parse a list of fields
+fn field_list(input: &str) -> IResult<&str, Vec<String>> {
+    separated_list1(
+        preceded(multispace0, char(',')),
+        preceded(multispace0, identifier),
+    )(input)
+}
+
+// Parse a list of partitions
+fn partition_list(input: &str) -> IResult<&str, Vec<String>> {
+    separated_list1(
+        preceded(multispace0, char(',')),
+        preceded(multispace0, identifier),
+    )(input)
+}
+
+// Parse a time range
+fn time_range_parser(input: &str) -> IResult<&str, (DateTime<Utc>, DateTime<Utc>)> {
+    let (input, _) = tag_no_case("range")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+    
+    // Parse start time
+    let (input, start_time) = datetime_value(input)?;
+    
+    let (input, _) = multispace0(input)?;
+    let (input, _) = char(',')(input)?;
+    let (input, _) = multispace0(input)?;
+    
+    // Parse end time
+    let (input, end_time) = datetime_value(input)?;
+    
+    let (input, _) = multispace0(input)?;
+    let (input, _) = char(')')(input)?;
+    
+    match (start_time, end_time) {
+        (Value::DateTime(start), Value::DateTime(end)) => Ok((input, (start, end))),
+        _ => Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        ))),
+    }
+}
+
+// Parse an order by list
+fn order_by_list(input: &str) -> IResult<&str, Vec<OrderBy>> {
+    separated_list1(
+        preceded(multispace0, char(',')),
+        preceded(multispace0, order_by_item),
+    )(input)
+}
+
+// Parse a single order by item
+fn order_by_item(input: &str) -> IResult<&str, OrderBy> {
+    let (input, field) = identifier(input)?;
+    let (input, direction) = opt(preceded(
+        multispace1,
+        alt((
+            value(OrderDirection::Asc, tag_no_case("asc")),
+            value(OrderDirection::Desc, tag_no_case("desc")),
+        )),
+    ))(input)?;
+    
+    Ok((
+        input,
+        OrderBy {
+            field,
+            direction: direction.unwrap_or(OrderDirection::Asc),
+        },
+    ))
+}
+
+// Parse an expression
+fn expression(input: &str) -> IResult<&str, Expression> {
+    let (input, first_expr) = logical_term(input)?;
+    
+    let (input, rest) = many0(pair(
+        preceded(multispace0, tag_no_case("or")),
+        preceded(multispace0, logical_term),
+    ))(input)?;
+    
+    if rest.is_empty() {
+        Ok((input, first_expr))
+    } else {
+        let mut expressions = vec![first_expr];
+        expressions.extend(rest.into_iter().map(|(_, expr)| expr));
+        
+        Ok((
+            input,
+            Expression::Logical {
+                operator: LogicalOperator::Or,
+                expressions,
+            },
+        ))
+    }
+}
+
+// Parse a logical term (expressions connected by AND)
+fn logical_term(input: &str) -> IResult<&str, Expression> {
+    let (input, first_expr) = logical_factor(input)?;
+    
+    let (input, rest) = many0(pair(
+        preceded(multispace0, tag_no_case("and")),
+        preceded(multispace0, logical_factor),
+    ))(input)?;
+    
+    if rest.is_empty() {
+        Ok((input, first_expr))
+    } else {
+        let mut expressions = vec![first_expr];
+        expressions.extend(rest.into_iter().map(|(_, expr)| expr));
+        
+        Ok((
+            input,
+            Expression::Logical {
+                operator: LogicalOperator::And,
+                expressions,
+            },
+        ))
+    }
+}
+
+// Parse a logical factor (comparison or grouped expression)
+fn logical_factor(input: &str) -> IResult<&str, Expression> {
+    alt((
+        delimited(
+            pair(char('('), multispace0),
+            expression,
+            pair(multispace0, char(')')),
+        ),
+        comparison,
+    ))(input)
+}
+
+// Parse a comparison expression
+fn comparison(input: &str) -> IResult<&str, Expression> {
+    let (input, field) = identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, operator) = comparison_operator(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, value) = value_parser(input)?;
+    
+    Ok((
+        input,
+        Expression::Comparison {
+            field,
+            operator,
+            value,
+        },
+    ))
+}
+
+// Parse a comparison operator
+fn comparison_operator(input: &str) -> IResult<&str, ComparisonOperator> {
+    alt((
+        value(ComparisonOperator::Equal, tag("=")),
+        value(ComparisonOperator::NotEqual, alt((tag("!="), tag("<>")))),
+        value(ComparisonOperator::GreaterThanOrEqual, tag(">=")),
+        value(ComparisonOperator::GreaterThan, tag(">")),
+        value(ComparisonOperator::LessThanOrEqual, tag("<=")),
+        value(ComparisonOperator::LessThan, tag("<")),
+        value(ComparisonOperator::Like, tag_no_case("like")),
+        value(ComparisonOperator::NotLike, tag_no_case("not like")),
+        value(ComparisonOperator::In, tag_no_case("in")),
+        value(ComparisonOperator::NotIn, tag_no_case("not in")),
+        value(ComparisonOperator::Contains, tag_no_case("contains")),
+        value(ComparisonOperator::NotContains, tag_no_case("not contains")),
+        value(ComparisonOperator::StartsWith, tag_no_case("starts with")),
+        value(ComparisonOperator::EndsWith, tag_no_case("ends with")),
+    ))(input)
+}
+
+// Parse a value
+fn value_parser(input: &str) -> IResult<&str, Value> {
+    alt((
+        array_value,
+        string_value,
+        boolean_value,
+        null_value,
+        datetime_value,
+        duration_value,
+        number_value,
+    ))(input)
+}
+
+// Parse a string value
+fn string_value(input: &str) -> IResult<&str, Value> {
+    alt((
+        // Double-quoted string
+        map(
+            delimited(
+                char('"'),
+                take_until("\""),
+                char('"'),
+            ),
+            |s: &str| Value::String(s.to_string()),
+        ),
+        // Single-quoted string
+        map(
+            delimited(
+                char('\''),
+                take_until("'"),
+                char('\''),
+            ),
+            |s: &str| Value::String(s.to_string()),
+        ),
+    ))(input)
+}
+
+// Parse a number value
+fn number_value(input: &str) -> IResult<&str, Value> {
+    map_res(
+        recognize(
+            pair(
+                opt(char('-')),
+                alt((
+                    // Decimal with optional decimal part
+                    recognize(
+                        pair(
+                            digit1,
+                            opt(preceded(char('.'), digit1)),
+                        ),
+                    ),
+                    // Just decimal part
+                    recognize(
+                        preceded(char('.'), digit1),
+                    ),
+                )),
+            ),
+        ),
+        |s: &str| s.parse::<f64>().map(Value::Number),
+    )(input)
+}
+
+// Parse a boolean value
+fn boolean_value(input: &str) -> IResult<&str, Value> {
+    alt((
+        value(Value::Boolean(true), tag_no_case("true")),
+        value(Value::Boolean(false), tag_no_case("false")),
+    ))(input)
+}
+
+// Parse a null value
+fn null_value(input: &str) -> IResult<&str, Value> {
+    value(Value::Null, tag_no_case("null"))(input)
+}
+
+// Parse a datetime value
+fn datetime_value(input: &str) -> IResult<&str, Value> {
+    // ISO 8601 format
+    let (input, datetime_str) = recognize(
+        tuple((
+            digit1,
+            char('-'),
+            digit1,
+            char('-'),
+            digit1,
+            opt(tuple((
+                char('T'),
+                digit1,
+                char(':'),
+                digit1,
+                opt(tuple((
+                    char(':'),
+                    digit1,
+                    opt(tuple((
+                        char('.'),
+                        digit1,
+                    ))),
+                ))),
+                opt(alt((
+                    char('Z'),
+                    tuple((
+                        alt((char('+'), char('-'))),
+                        digit1,
+                        opt(tuple((
+                            char(':'),
+                            digit1,
+                        ))),
+                    )),
+                ))),
+            ))),
+        ))
+    )(input)?;
+    
+    // Parse the datetime string
+    match chrono::DateTime::parse_from_rfc3339(datetime_str) {
+        Ok(dt) => Ok((input, Value::DateTime(dt.with_timezone(&Utc)))),
+        Err(_) => Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        ))),
+    }
+}
+
+// Parse a duration value
+fn duration_value(input: &str) -> IResult<&str, Value> {
+    let (input, duration_str) = delimited(
+        tag("duration("),
+        take_until(")"),
+        char(')'),
+    )(input)?;
+    
+    // Simple duration parser that handles "1h", "30m", "10s", etc.
+    let mut total_seconds = 0u64;
+    let mut current_value = 0u64;
+    let mut chars = duration_str.chars().peekable();
+    
+    while let Some(c) = chars.next() {
+        if c.is_digit(10) {
+            current_value = current_value * 10 + c.to_digit(10).unwrap() as u64;
+        } else {
+            match c {
+                's' => total_seconds += current_value,
+                'm' => total_seconds += current_value * 60,
+                'h' => total_seconds += current_value * 3600,
+                'd' => total_seconds += current_value * 86400,
+                'w' => total_seconds += current_value * 604800,
+                _ => {
+                    return Err(nom::Err::Error(nom::error::Error::new(
+                        input,
+                        nom::error::ErrorKind::Tag,
+                    )))
+                }
+            }
+            
+            current_value = 0;
+        }
+    }
+    
+    Ok((input, Value::Duration(Duration::from_secs(total_seconds))))
+}
+
+// Parse an array value
+fn array_value(input: &str) -> IResult<&str, Value> {
+    map(
+        delimited(
+            pair(char('['), multispace0),
+            separated_list0(
+                delimited(multispace0, char(','), multispace0),
+                value_parser,
+            ),
+            pair(multispace0, char(']')),
+        ),
+        Value::Array,
+    )(input)
+}
+
+// Parse an identifier
+fn identifier(input: &str) -> IResult<&str, String> {
+    map(
+        take_while1(|c| {
+            is_alphanumeric(c) || c == '_' || c == '.'
+        }),
+        |s: &str| s.to_string(),
+    )(input)
+}
+
+// Helper function to check if a character is alphanumeric
+fn is_alphanumeric(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+// Evaluate an expression against a log entry
+pub fn evaluate_expression(expr: &Expression, entry: &LogEntry) -> bool {
+    match expr {
+        Expression::Comparison {
+            field,
+            operator,
+            value,
+        } => {
+            let entry_value = get_field_value(field, entry);
+            compare_values(operator, &entry_value, value)
+        }
+        Expression::Logical {
+            operator,
+            expressions,
+        } => {
+            match operator {
+                LogicalOperator::And => expressions
+                    .iter()
+                    .all(|expr| evaluate_expression(expr, entry)),
+                LogicalOperator::Or => expressions
+                    .iter()
+                    .any(|expr| evaluate_expression(expr, entry)),
+            }
+        }
+        Expression::Grouped(expr) => evaluate_expression(expr, entry),
+        Expression::None => true,
+    }
+}
+
+// Get a field value from a log entry
+fn get_field_value(field: &str, entry: &LogEntry) -> Value {
+    match field {
+        "timestamp" => Value::DateTime(entry.timestamp),
+        "source" => Value::String(entry.source.clone()),
+        "message" => Value::String(entry.message.clone()),
+        _ => {
+            // Check if it's a tag
+            if field.starts_with("tags.") {
+                let tag_name = &field[5..];
+                if let Some(tag_value) = entry.tags.get(tag_name) {
+                    Value::String(tag_value.clone())
+                } else {
+                    Value::Null
+                }
+            } else {
+                Value::Null
+            }
+        }
+    }
+}
+
+// Compare two values using the given operator
+fn compare_values(op: &ComparisonOperator, left: &Value, right: &Value) -> bool {
+    match op {
+        ComparisonOperator::Equal => values_equal(left, right),
+        ComparisonOperator::NotEqual => !values_equal(left, right),
+        ComparisonOperator::GreaterThan => values_greater_than(left, right),
+        ComparisonOperator::GreaterThanOrEqual => {
+            values_greater_than(left, right) || values_equal(left, right)
+        }
+        ComparisonOperator::LessThan => values_less_than(left, right),
+        ComparisonOperator::LessThanOrEqual => {
+            values_less_than(left, right) || values_equal(left, right)
+        }
+        ComparisonOperator::Like => values_like(left, right),
+        ComparisonOperator::NotLike => !values_like(left, right),
+        ComparisonOperator::In => values_in(left, right),
+        ComparisonOperator::NotIn => !values_in(left, right),
+        ComparisonOperator::Contains => values_contains(left, right),
+        ComparisonOperator::NotContains => !values_contains(left, right),
+        ComparisonOperator::StartsWith => values_starts_with(left, right),
+        ComparisonOperator::EndsWith => values_ends_with(left, right),
+    }
+}
+
+// Check if two values are equal
+fn values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::String(l), Value::String(r)) => l == r,
+        (Value::Number(l), Value::Number(r)) => (l - r).abs() < f64::EPSILON,
+        (Value::Boolean(l), Value::Boolean(r)) => l == r,
+        (Value::DateTime(l), Value::DateTime(r)) => l == r,
+        (Value::Duration(l), Value::Duration(r)) => l == r,
+        (Value::Null, Value::Null) => true,
+        _ => false,
+    }
+}
+
+// Check if left value is greater than right value
+fn values_greater_than(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(l), Value::Number(r)) => l > r,
+        (Value::DateTime(l), Value::DateTime(r)) => l > r,
+        (Value::Duration(l), Value::Duration(r)) => l > r,
+        _ => false,
+    }
+}
+
+// Check if left value is less than right value
+fn values_less_than(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(l), Value::Number(r)) => l < r,
+        (Value::DateTime(l), Value::DateTime(r)) => l < r,
+        (Value::Duration(l), Value::Duration(r)) => l < r,
+        _ => false,
+    }
+}
+
+// Check if left value is like right value (simple pattern matching)
+fn values_like(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::String(l), Value::String(r)) => {
+            let pattern = r.replace('%', ".*").replace('_', ".");
+            let regex = regex::Regex::new(&format!("^{}$", pattern)).unwrap();
+            regex.is_match(l)
+        }
+        _ => false,
+    }
+}
+
+// Check if left value is in right value (array)
+fn values_in(left: &Value, right: &Value) -> bool {
+    match right {
+        Value::Array(values) => values.iter().any(|v| values_equal(left, v)),
+        _ => false,
+    }
+}
+
+// Check if left value contains right value
+fn values_contains(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::String(l), Value::String(r)) => l.contains(r),
+        _ => false,
+    }
+}
+
+// Check if left value starts with right value
+fn values_starts_with(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::String(l), Value::String(r)) => l.starts_with(r),
+        _ => false,
+    }
+}
+
+// Check if left value ends with right value
+fn values_ends_with(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::String(l), Value::String(r)) => l.ends_with(r),
+        _ => false,
+    }
+}
+$$--GLUE--$$
+.\storage\block.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// storage/block.rs - Block-based storage implementation
+
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use crc32fast::Hasher;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::config::{BlockRotationPolicy, CompressionAlgorithm};
+use crate::storage::compression::{compress_data, decompress_data, CompressionError};
+use crate::storage::index::{Index, IndexEntry, IndexError};
+
+// Block-related errors
+#[derive(Error, Debug)]
+pub enum BlockError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] bincode::Error),
+    
+    #[error("Compression error: {0}")]
+    Compression(String),
+    
+    #[error("Index error: {0}")]
+    Index(#[from] IndexError),
+    
+    #[error("Invalid block format: {0}")]
+    InvalidFormat(String),
+    
+    #[error("Block corrupted: {0}")]
+    Corrupted(String),
+    
+    #[error("Block not found: {0}")]
+    NotFound(String),
+}
+
+// Implement From<CompressionError> for BlockError
+impl From<CompressionError> for BlockError {
+    fn from(err: CompressionError) -> Self {
+        BlockError::Compression(err.to_string())
+    }
+}
+
+// Block status
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockStatus {
+    /// Active block that is currently being written to
+    Active,
+    /// Sealed block that is no longer accepting writes
+    Sealed,
+    /// Archived block that has been compressed
+    Archived,
+}
+
+// Block metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockMetadata {
+    /// Unique block ID
+    pub id: String,
+    /// Block creation timestamp
+    pub created_at: DateTime<Utc>,
+    /// Block sealing timestamp (if sealed)
+    pub sealed_at: Option<DateTime<Utc>>,
+    /// Number of entries in the block
+    pub entry_count: u64,
+    /// Uncompressed size in bytes
+    pub uncompressed_size: u64,
+    /// Compressed size in bytes (if compressed)
+    pub compressed_size: Option<u64>,
+    /// Compression algorithm used (if compressed)
+    pub compression: CompressionAlgorithm,
+    /// CRC32 checksum of the entire block
+    pub checksum: u32,
+    /// Is this block marked for deletion
+    pub marked_for_deletion: bool,
+}
+
+// Individual log entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    /// Entry timestamp
+    pub timestamp: DateTime<Utc>,
+    /// Entry source (hostname, service name, etc.)
+    pub source: String,
+    /// Optional structured tags
+    pub tags: BTreeMap<String, String>,
+    /// The log message itself
+    pub message: String,
+}
+
+// Block header stored at the beginning of each block file
+#[derive(Debug, Serialize, Deserialize)]
+struct BlockHeader {
+    /// Magic bytes to identify TimberDB block files
+    magic: [u8; 8],
+    /// Format version
+    version: u16,
+    /// Block metadata
+    metadata: BlockMetadata,
+}
+
+impl BlockHeader {
+    const MAGIC: [u8; 8] = *b"TIMBERDB";
+    const VERSION: u16 = 1;
+    
+    fn new(metadata: BlockMetadata) -> Self {
+        BlockHeader {
+            magic: Self::MAGIC,
+            version: Self::VERSION,
+            metadata,
+        }
+    }
+    
+    fn validate(&self) -> Result<(), BlockError> {
+        if self.magic != Self::MAGIC {
+            return Err(BlockError::InvalidFormat(
+                "Invalid magic bytes".to_string(),
+            ));
+        }
+        
+        if self.version != Self::VERSION {
+            return Err(BlockError::InvalidFormat(
+                format!("Unsupported version: {}", self.version),
+            ));
+        }
+        
+        Ok(())
+    }
+}
+
+// A block of log entries
+#[derive(Debug)]
+pub struct Block {
+    /// Block metadata
+    metadata: BlockMetadata,
+    /// Path to the block file
+    path: PathBuf,
+    /// Current status of the block
+    status: BlockStatus,
+    /// File handle for active blocks
+    file: Option<File>,
+    /// In-memory index for fast lookups
+    index: Arc<RwLock<Index>>,
+    /// Writer position for appending entries
+    write_pos: u64,
+}
+
+impl Block {
+    /// Create a new active block
+    pub fn create(
+        block_id: String,
+        dir_path: &Path,
+        compression: CompressionAlgorithm,
+    ) -> Result<Self, BlockError> {
+        let now = Utc::now();
+        let metadata = BlockMetadata {
+            id: block_id.clone(),
+            created_at: now,
+            sealed_at: None,
+            entry_count: 0,
+            uncompressed_size: 0,
+            compressed_size: None,
+            compression,
+            checksum: 0,
+            marked_for_deletion: false,
+        };
+        
+        // Ensure directory exists
+        fs::create_dir_all(dir_path)?;
+        
+        // Create block filename and path
+        let filename = format!("{}.block", block_id);
+        let path = dir_path.join(filename);
+        
+        // Create and initialize block file
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        
+        // Write block header
+        let header = BlockHeader::new(metadata.clone());
+        let header_bytes = bincode::serialize(&header)?;
+        file.write_all(&header_bytes)?;
+        
+        // Create index file
+        let index_path = dir_path.join(format!("{}.index", block_id));
+        let index = Index::create(&index_path)?;
+        
+        Ok(Block {
+            metadata,
+            path,
+            status: BlockStatus::Active,
+            file: Some(file),
+            index: Arc::new(RwLock::new(index)),
+            write_pos: header_bytes.len() as u64,
+        })
+    }
+    
+    /// Open an existing block
+    pub fn open(path: PathBuf) -> Result<Self, BlockError> {
+        if !path.exists() {
+            return Err(BlockError::NotFound(
+                format!("Block file not found: {}", path.display()),
+            ));
+        }
+        
+        let file = File::open(&path)?;
+        
+        // Read and validate header
+        let mut reader = BufReader::new(&file);
+        let mut header_bytes = Vec::new();
+        reader.read_to_end(&mut header_bytes)?;
+        
+        let header: BlockHeader = bincode::deserialize(&header_bytes)?;
+        header.validate()?;
+        
+        // Determine block status
+        let status = if header.metadata.sealed_at.is_some() {
+            if header.metadata.compressed_size.is_some() {
+                BlockStatus::Archived
+            } else {
+                BlockStatus::Sealed
+            }
+        } else {
+            BlockStatus::Active
+        };
+        
+        // Open index
+        let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+        let index_path = path.with_file_name(format!("{}.index", stem));
+        let index = Index::open(&index_path)?;
+        
+        // For active blocks, get write position
+        let write_pos = if status == BlockStatus::Active {
+            file.metadata()?.len()
+        } else {
+            0
+        };
+        
+        // Only keep file handle for active blocks
+        let file_handle = if status == BlockStatus::Active {
+            Some(file)
+        } else {
+            None
+        };
+        
+        Ok(Block {
+            metadata: header.metadata,
+            path,
+            status,
+            file: file_handle,
+            index: Arc::new(RwLock::new(index)),
+            write_pos,
+        })
+    }
+    
+    /// Append a log entry to the block (only for active blocks)
+    pub fn append(&mut self, entry: LogEntry) -> Result<u64, BlockError> {
+        if self.status != BlockStatus::Active {
+            return Err(BlockError::InvalidFormat(
+                "Cannot append to sealed or archived block".to_string(),
+            ));
+        }
+        
+        let file = self.file.as_mut().unwrap();
+        
+        // Serialize entry
+        let entry_bytes = bincode::serialize(&entry)?;
+        let entry_len = entry_bytes.len() as u32;
+        
+        // Calculate entry CRC
+        let mut hasher = Hasher::new();
+        hasher.update(&entry_bytes);
+        let entry_crc = hasher.finalize();
+        
+        // Format: [entry_length:u32][entry_crc:u32][entry_data]
+        file.seek(SeekFrom::Start(self.write_pos))?;
+        file.write_all(&entry_len.to_le_bytes())?;
+        file.write_all(&entry_crc.to_le_bytes())?;
+        let entry_pos = file.stream_position()?;
+        file.write_all(&entry_bytes)?;
+        
+        // Update metadata
+        self.metadata.entry_count += 1;
+        self.metadata.uncompressed_size = file.stream_position()?;
+        
+        // Update write position
+        self.write_pos = self.metadata.uncompressed_size;
+        
+        // Add to index
+        let entry_id = self.metadata.entry_count - 1;
+        let index_entry = IndexEntry {
+            id: entry_id,
+            timestamp: entry.timestamp,
+            position: entry_pos,
+            length: entry_len,
+        };
+        
+        let mut index = self.index.write().map_err(|e| 
+            BlockError::InvalidFormat(format!("Failed to acquire index write lock: {}", e))
+        )?;
+        index.add_entry(index_entry)?;
+        
+        Ok(entry_id)
+    }
+    
+    /// Seal the block, preventing further writes
+    pub fn seal(&mut self) -> Result<(), BlockError> {
+        if self.status != BlockStatus::Active {
+            return Err(BlockError::InvalidFormat(
+                "Block is already sealed".to_string(),
+            ));
+        }
+        
+        // Update metadata
+        self.metadata.sealed_at = Some(Utc::now());
+        
+        // Update header
+        let file = self.file.as_mut().unwrap();
+        file.seek(SeekFrom::Start(0))?;
+        
+        let header = BlockHeader::new(self.metadata.clone());
+        let header_bytes = bincode::serialize(&header)?;
+        file.write_all(&header_bytes)?;
+        file.flush()?;
+        
+        // Close file handle
+        self.file = None;
+        self.status = BlockStatus::Sealed;
+        
+        Ok(())
+    }
+    
+    /// Archive (compress) the block to save space
+    pub fn archive(&mut self, compression_level: i32) -> Result<(), BlockError> {
+        if self.status != BlockStatus::Sealed {
+            return Err(BlockError::InvalidFormat(
+                "Only sealed blocks can be archived".to_string(),
+            ));
+        }
+        
+        // Read the entire block file
+        let file_content = fs::read(&self.path)?;
+        
+        // Compress the data
+        let compressed_data = compress_data(
+            &file_content,
+            self.metadata.compression,
+            compression_level,
+        )?;
+        
+        // Create archive file
+        let archive_path = self.path.with_extension("block.archive");
+        let mut archive_file = File::create(&archive_path)?;
+        
+        // Write compressed data
+        archive_file.write_all(&compressed_data)?;
+        archive_file.flush()?;
+        
+        // Update metadata
+        self.metadata.compressed_size = Some(compressed_data.len() as u64);
+        
+        // Write updated metadata to a separate file
+        let meta_path = self.path.with_extension("meta");
+        let meta_file = File::create(&meta_path)?;
+        let mut writer = BufWriter::new(meta_file);
+        
+        let header = BlockHeader::new(self.metadata.clone());
+        bincode::serialize_into(&mut writer, &header)?;
+        writer.flush()?;
+        
+        // Remove original file to save space
+        fs::remove_file(&self.path)?;
+        
+        // Update internal state
+        self.path = archive_path;
+        self.status = BlockStatus::Archived;
+        
+        Ok(())
+    }
+    
+    /// Read a specific log entry by ID
+    pub fn read_entry(&self, entry_id: u64) -> Result<LogEntry, BlockError> {
+        if entry_id >= self.metadata.entry_count {
+            return Err(BlockError::NotFound(
+                format!("Entry ID {} not found in block", entry_id),
+            ));
+        }
+        
+        // Get entry position from index
+        let index_entry = self.index.read().map_err(|e|
+            BlockError::InvalidFormat(format!("Failed to acquire index read lock: {}", e))
+        )?.get_entry_by_id(entry_id)?;
+        
+        // Read the entry based on block status
+        match self.status {
+            BlockStatus::Active => {
+                // For active blocks, we have an open file handle
+                let mut file = self.file.as_ref().unwrap().try_clone()?;
+                file.seek(SeekFrom::Start(index_entry.position))?;
+                
+                let mut entry_data = vec![0u8; index_entry.length as usize];
+                file.read_exact(&mut entry_data)?;
+                
+                let entry: LogEntry = bincode::deserialize(&entry_data)?;
+                Ok(entry)
+            }
+            BlockStatus::Sealed => {
+                // For sealed blocks, open the file
+                let mut file = File::open(&self.path)?;
+                file.seek(SeekFrom::Start(index_entry.position))?;
+                
+                let mut entry_data = vec![0u8; index_entry.length as usize];
+                file.read_exact(&mut entry_data)?;
+                
+                let entry: LogEntry = bincode::deserialize(&entry_data)?;
+                Ok(entry)
+            }
+            BlockStatus::Archived => {
+                // For archived blocks, decompress first
+                let compressed_data = fs::read(&self.path)?;
+                
+                // Decompress the data
+                let data = decompress_data(
+                    &compressed_data,
+                    self.metadata.compression,
+                )?;
+                
+                // Extract the entry from decompressed data
+                let entry_data = &data[index_entry.position as usize..(index_entry.position as usize + index_entry.length as usize)];
+                
+                let entry: LogEntry = bincode::deserialize(entry_data)?;
+                Ok(entry)
+            }
+        }
+    }
+    
+    /// Get block metadata
+    pub fn metadata(&self) -> &BlockMetadata {
+        &self.metadata
+    }
+    
+    /// Get mutable reference to block metadata
+    pub fn metadata_mut(&mut self) -> &mut BlockMetadata {
+        &mut self.metadata
+    }
+    
+    /// Get block status
+    pub fn status(&self) -> BlockStatus {
+        self.status
+    }
+    
+    /// Get block path
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    
+    /// Mark block for deletion
+    pub fn mark_for_deletion(&mut self) -> Result<(), BlockError> {
+        self.metadata.marked_for_deletion = true;
+        
+        // Update header or metadata file
+        match self.status {
+            BlockStatus::Active => {
+                let file = self.file.as_mut().unwrap();
+                file.seek(SeekFrom::Start(0))?;
+                
+                let header = BlockHeader::new(self.metadata.clone());
+                let header_bytes = bincode::serialize(&header)?;
+                file.write_all(&header_bytes)?;
+                file.flush()?;
+            }
+            BlockStatus::Sealed | BlockStatus::Archived => {
+                let meta_path = self.path.with_extension("meta");
+                let meta_file = File::create(&meta_path)?;
+                let mut writer = BufWriter::new(meta_file);
+                
+                let header = BlockHeader::new(self.metadata.clone());
+                bincode::serialize_into(&mut writer, &header)?;
+                writer.flush()?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Delete the block permanently
+    pub fn delete(self) -> Result<(), BlockError> {
+        // Delete block file
+        if self.path.exists() {
+            fs::remove_file(&self.path)?;
+        }
+        
+        // Delete index file
+        let index_path = self.path.with_extension("index");
+        if index_path.exists() {
+            fs::remove_file(&index_path)?;
+        }
+        
+        // Delete metadata file if exists
+        let meta_path = self.path.with_extension("meta");
+        if meta_path.exists() {
+            fs::remove_file(&meta_path)?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Check if block should be rotated based on policy
+    pub fn should_rotate(&self, policy: &BlockRotationPolicy) -> bool {
+        match policy {
+            BlockRotationPolicy::Time(duration) => {
+                let block_age = Utc::now()
+                    .signed_duration_since(self.metadata.created_at)
+                    .to_std()
+                    .unwrap_or_else(|_| Duration::from_secs(0));
+                
+                block_age >= *duration
+            }
+            BlockRotationPolicy::Size(max_size) => {
+                self.metadata.uncompressed_size >= *max_size
+            }
+            BlockRotationPolicy::Count(max_entries) => {
+                self.metadata.entry_count >= *max_entries
+            }
+        }
+    }
+}
+$$--GLUE--$$
+.\storage\compression.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// storage/compression.rs - Compression algorithms implementation
+
+use std::io;
+use thiserror::Error;
+
+use crate::config::CompressionAlgorithm;
+
+// Compression errors
+#[derive(Error, Debug)]
+pub enum CompressionError {
+    #[error("Compression error: {0}")]
+    Compression(String),
+    
+    #[error("Decompression error: {0}")]
+    Decompression(String),
+    
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    
+    #[error("Unsupported compression algorithm: {0:?}")]
+    UnsupportedAlgorithm(CompressionAlgorithm),
+}
+
+/// Compress data using the specified algorithm
+pub fn compress_data(
+    data: &[u8],
+    algorithm: CompressionAlgorithm,
+    level: i32,
+) -> Result<Vec<u8>, CompressionError> {
+    match algorithm {
+        CompressionAlgorithm::None => {
+            // No compression, just return the data
+            Ok(data.to_vec())
+        }
+        CompressionAlgorithm::LZ4 => {
+            // Use LZ4 compression
+            Ok(lz4_flex::block::compress(data))
+        }
+        CompressionAlgorithm::Zstd => {
+            // Use Zstd compression
+            let level = level.clamp(1, 22); // Valid zstd levels: 1-22
+            
+            zstd::bulk::compress(data, level)
+                .map_err(|e| CompressionError::Compression(e.to_string()))
+        }
+        CompressionAlgorithm::Snappy => {
+            // Use Snappy compression
+            snap::raw::Encoder::new().compress_vec(data)
+                .map_err(|e| CompressionError::Compression(e.to_string()))
+        }
+        CompressionAlgorithm::Gzip => {
+            // Use Gzip compression
+            let mut encoder = flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::new(level.clamp(0, 9) as u32),
+            );
+            
+            match std::io::copy(&mut &data[..], &mut encoder) {
+                Ok(_) => encoder.finish()
+                    .map_err(|e| CompressionError::Compression(e.to_string())),
+                Err(e) => Err(CompressionError::Compression(e.to_string())),
+            }
+        }
+    }
+}
+
+/// Decompress data using the specified algorithm
+pub fn decompress_data(
+    data: &[u8],
+    algorithm: CompressionAlgorithm,
+) -> Result<Vec<u8>, CompressionError> {
+    match algorithm {
+        CompressionAlgorithm::None => {
+            // No compression, just return the data
+            Ok(data.to_vec())
+        }
+        CompressionAlgorithm::LZ4 => {
+            // Use LZ4 decompression
+            // For decompression we need to specify max decompressed size as a safety feature
+            let max_size = 1024 * 1024 * 1024; // 1GB max size as a reasonable limit
+            lz4_flex::block::decompress(data, max_size)
+                .map_err(|e| CompressionError::Decompression(e.to_string()))
+        }
+        CompressionAlgorithm::Zstd => {
+            // Use Zstd decompression
+            let max_size = 1024 * 1024 * 1024; // 1GB max size as a reasonable limit
+            zstd::bulk::decompress(data, max_size)
+                .map_err(|e| CompressionError::Decompression(e.to_string()))
+        }
+        CompressionAlgorithm::Snappy => {
+            // Use Snappy decompression
+            snap::raw::Decoder::new().decompress_vec(data)
+                .map_err(|e| CompressionError::Decompression(e.to_string()))
+        }
+        CompressionAlgorithm::Gzip => {
+            // Use Gzip decompression
+            let mut decoder = flate2::read::GzDecoder::new(data);
+            let mut result = Vec::new();
+            
+            match io::copy(&mut decoder, &mut result) {
+                Ok(_) => Ok(result),
+                Err(e) => Err(CompressionError::Decompression(e.to_string())),
+            }
+        }
+    }
+}
+
+/// Calculate the compression ratio (original size / compressed size)
+pub fn compression_ratio(original_size: u64, compressed_size: u64) -> f64 {
+    if compressed_size == 0 {
+        return 0.0;
+    }
+    
+    original_size as f64 / compressed_size as f64
+}
+$$--GLUE--$$
+.\storage\index.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// storage/index.rs - Indexing for efficient log retrieval
+
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+// Index errors
+#[derive(Error, Debug)]
+pub enum IndexError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] bincode::Error),
+    
+    #[error("Entry not found: {0}")]
+    NotFound(String),
+    
+    #[error("Invalid index format: {0}")]
+    InvalidFormat(String),
+}
+
+// Index header stored at the beginning of each index file
+#[derive(Debug, Serialize, Deserialize)]
+struct IndexHeader {
+    /// Magic bytes to identify TimberDB index files
+    magic: [u8; 8],
+    /// Format version
+    version: u16,
+    /// Number of entries in the index
+    entry_count: u64,
+    /// Timestamp of oldest entry
+    oldest_timestamp: DateTime<Utc>,
+    /// Timestamp of newest entry
+    newest_timestamp: DateTime<Utc>,
+}
+
+impl IndexHeader {
+    const MAGIC: [u8; 8] = *b"TDBRIDGE";
+    const VERSION: u16 = 1;
+    
+    fn new(
+        entry_count: u64,
+        oldest_timestamp: DateTime<Utc>,
+        newest_timestamp: DateTime<Utc>,
+    ) -> Self {
+        IndexHeader {
+            magic: Self::MAGIC,
+            version: Self::VERSION,
+            entry_count,
+            oldest_timestamp,
+            newest_timestamp,
+        }
+    }
+    
+    fn validate(&self) -> Result<(), IndexError> {
+        if self.magic != Self::MAGIC {
+            return Err(IndexError::InvalidFormat(
+                "Invalid magic bytes".to_string(),
+            ));
+        }
+        
+        if self.version != Self::VERSION {
+            return Err(IndexError::InvalidFormat(
+                format!("Unsupported version: {}", self.version),
+            ));
+        }
+        
+        Ok(())
+    }
+}
+
+// Entry in the index
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexEntry {
+    /// Entry ID
+    pub id: u64,
+    /// Entry timestamp
+    pub timestamp: DateTime<Utc>,
+    /// Position in the block file
+    pub position: u64,
+    /// Length of the entry data
+    pub length: u32,
+}
+
+// In-memory index
+#[derive(Debug)]
+pub struct Index {
+    /// Path to the index file
+    path: PathBuf,
+    /// File handle for writing
+    file: Option<File>,
+    /// Entry count
+    entry_count: AtomicU64,
+    /// Entries by ID
+    entries_by_id: BTreeMap<u64, IndexEntry>,
+    /// Entries by timestamp
+    entries_by_timestamp: BTreeMap<DateTime<Utc>, Vec<IndexEntry>>,
+    /// Offset where entries start in the file
+    entries_offset: u64,
+    /// Oldest timestamp in the index
+    oldest_timestamp: DateTime<Utc>,
+    /// Newest timestamp in the index
+    newest_timestamp: DateTime<Utc>,
+}
+
+impl Index {
+    /// Create a new index
+    pub fn create(path: &Path) -> Result<Self, IndexError> {
+        // Create parent directory if needed
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        
+        // Create and open index file
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        
+        let now = Utc::now();
+        
+        // Write empty header
+        let header = IndexHeader::new(0, now, now);
+        let header_bytes = bincode::serialize(&header)?;
+        
+        {
+            let mut writer = BufWriter::new(&file);
+            writer.write_all(&header_bytes)?;
+            writer.flush()?;
+        }
+        
+        Ok(Index {
+            path: path.to_path_buf(),
+            file: Some(file),
+            entry_count: AtomicU64::new(0),
+            entries_by_id: BTreeMap::new(),
+            entries_by_timestamp: BTreeMap::new(),
+            entries_offset: header_bytes.len() as u64,
+            oldest_timestamp: now,
+            newest_timestamp: now,
+        })
+    }
+    
+    /// Open an existing index
+    pub fn open(path: &Path) -> Result<Self, IndexError> {
+        // Open index file
+        let file = match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Create new index if file doesn't exist
+                return Self::create(path);
+            }
+            Err(e) => return Err(IndexError::Io(e)),
+        };
+        
+        let mut reader = BufReader::new(&file);
+        
+        // Read and validate header
+        let header_bytes = bincode::deserialize_from(&mut reader)?;
+        let header: IndexHeader = header_bytes;
+        header.validate()?;
+        
+        // Calculate entries offset
+        let entries_offset = reader.stream_position()?;
+        
+        // Read all entries
+        let mut entries_by_id = BTreeMap::new();
+        let mut entries_by_timestamp = BTreeMap::new();
+        
+        for _ in 0..header.entry_count {
+            let entry: IndexEntry = bincode::deserialize_from(&mut reader)?;
+            
+            // Add to maps
+            entries_by_id.insert(entry.id, entry.clone());
+            
+            entries_by_timestamp
+                .entry(entry.timestamp)
+                .or_insert_with(Vec::new)
+                .push(entry);
+        }
+        
+        Ok(Index {
+            path: path.to_path_buf(),
+            file: Some(file),
+            entry_count: AtomicU64::new(header.entry_count),
+            entries_by_id,
+            entries_by_timestamp,
+            entries_offset,
+            oldest_timestamp: header.oldest_timestamp,
+            newest_timestamp: header.newest_timestamp,
+        })
+    }
+    
+    /// Add a new entry to the index
+    pub fn add_entry(&mut self, entry: IndexEntry) -> Result<(), IndexError> {
+        // Update oldest/newest timestamps
+        if self.entry_count.load(Ordering::Relaxed) == 0 {
+            self.oldest_timestamp = entry.timestamp;
+            self.newest_timestamp = entry.timestamp;
+        } else {
+            if entry.timestamp < self.oldest_timestamp {
+                self.oldest_timestamp = entry.timestamp;
+            }
+            if entry.timestamp > self.newest_timestamp {
+                self.newest_timestamp = entry.timestamp;
+            }
+        }
+        
+        // Write entry to file
+        if let Some(file) = &mut self.file {
+            file.seek(SeekFrom::End(0))?;
+            let mut writer = BufWriter::new(file);
+            bincode::serialize_into(&mut writer, &entry)?;
+            writer.flush()?;
+        }
+        
+        // Update in-memory maps
+        self.entries_by_id.insert(entry.id, entry.clone());
+        
+        self.entries_by_timestamp
+            .entry(entry.timestamp)
+            .or_insert_with(Vec::new)
+            .push(entry);
+        
+        // Increment entry count
+        self.entry_count.fetch_add(1, Ordering::SeqCst);
+        
+        // Update header
+        self.update_header()?;
+        
+        Ok(())
+    }
+    
+    /// Update the header with current metadata
+    fn update_header(&mut self) -> Result<(), IndexError> {
+        if let Some(file) = &mut self.file {
+            file.seek(SeekFrom::Start(0))?;
+            
+            let header = IndexHeader::new(
+                self.entry_count.load(Ordering::Relaxed),
+                self.oldest_timestamp,
+                self.newest_timestamp,
+            );
+            
+            bincode::serialize_into(file, &header)?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Get an entry by ID
+    pub fn get_entry_by_id(&self, id: u64) -> Result<IndexEntry, IndexError> {
+        self.entries_by_id
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| IndexError::NotFound(format!("Entry with ID {} not found", id)))
+    }
+    
+    /// Get entries by timestamp
+    pub fn get_entries_by_timestamp(
+        &self,
+        timestamp: DateTime<Utc>,
+    ) -> Vec<IndexEntry> {
+        self.entries_by_timestamp
+            .get(&timestamp)
+            .cloned()
+            .unwrap_or_default()
+    }
+    
+    /// Get entries within a time range
+    pub fn get_entries_in_range(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Vec<IndexEntry> {
+        let mut result = Vec::new();
+        
+        for (ts, entries) in self.entries_by_timestamp.range(start..=end) {
+            result.extend(entries.clone());
+        }
+        
+        result
+    }
+    
+    /// Close the index, flushing any pending changes
+    pub fn close(mut self) -> Result<(), IndexError> {
+        if let Some(mut file) = self.file.take() {
+            // Update header one last time
+            self.update_header()?;
+            
+            // Flush and close
+            file.flush()?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Get the number of entries in the index
+    pub fn entry_count(&self) -> u64 {
+        self.entry_count.load(Ordering::Relaxed)
+    }
+    
+    /// Get the oldest timestamp in the index
+    pub fn oldest_timestamp(&self) -> DateTime<Utc> {
+        self.oldest_timestamp
+    }
+    
+    /// Get the newest timestamp in the index
+    pub fn newest_timestamp(&self) -> DateTime<Utc> {
+        self.newest_timestamp
+    }
+}
+$$--GLUE--$$
+.\storage\manager.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// storage/manager.rs - Storage management for blocks and partitions
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+use std::thread;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use uuid::Uuid;
+
+use crate::config::StorageConfig;
+use crate::storage::block::{Block, BlockMetadata, BlockStatus, LogEntry};
+
+// Storage manager errors
+#[derive(Error, Debug)]
+pub enum StorageError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    
+    #[error("Block error: {0}")]
+    Block(#[from] crate::storage::block::BlockError),
+    
+    #[error("Partition not found: {0}")]
+    PartitionNotFound(String),
+    
+    #[error("Block not found: {0}")]
+    BlockNotFound(String),
+    
+    #[error("Storage limit exceeded")]
+    StorageLimitExceeded,
+    
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+}
+
+// Partition metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionMetadata {
+    /// Partition ID
+    pub id: String,
+    /// Partition name
+    pub name: String,
+    /// Partition creation time
+    pub created_at: DateTime<Utc>,
+    /// Blocks in this partition
+    pub blocks: Vec<String>,
+    /// Active block ID
+    pub active_block: Option<String>,
+    /// Total entry count
+    pub entry_count: u64,
+    /// Total size in bytes
+    pub size_bytes: u64,
+}
+
+// Storage manager for handling blocks and partitions
+#[derive(Debug)]
+pub struct StorageManager {
+    /// Base directory for all storage
+    data_dir: PathBuf,
+    /// Configuration
+    config: StorageConfig,
+    /// Partitions by ID
+    partitions: RwLock<HashMap<String, PartitionMetadata>>,
+    /// Active blocks by partition ID
+    active_blocks: RwLock<HashMap<String, Arc<Mutex<Block>>>>,
+    /// Block metadata cache
+    block_metadata: RwLock<HashMap<String, BlockMetadata>>,
+    /// Background task handle
+    maintenance_handle: Option<thread::JoinHandle<()>>,
+    /// Signal to stop background tasks
+    shutdown: Arc<RwLock<bool>>,
+}
+
+impl StorageManager {
+    /// Create a new storage manager
+    pub fn new(config: StorageConfig) -> Result<Self, StorageError> {
+        // Validate configuration
+        if !config.data_dir.exists() {
+            fs::create_dir_all(&config.data_dir)?;
+        }
+        
+        // Initialize storage manager
+        let manager = StorageManager {
+            data_dir: config.data_dir.clone(),
+            config,
+            partitions: RwLock::new(HashMap::new()),
+            active_blocks: RwLock::new(HashMap::new()),
+            block_metadata: RwLock::new(HashMap::new()),
+            maintenance_handle: None,
+            shutdown: Arc::new(RwLock::new(false)),
+        };
+        
+        // Load existing partitions
+        manager.load_partitions()?;
+        
+        // Start background maintenance
+        manager.start_maintenance();
+        
+        Ok(manager)
+    }
+    
+    /// Load existing partitions from disk
+    fn load_partitions(&self) -> Result<(), StorageError> {
+        log::info!("Loading partitions from {}", self.data_dir.display());
+        
+        // Find all partition directories
+        let entries = fs::read_dir(&self.data_dir)?;
+        let mut partitions = self.partitions.write().unwrap();
+        
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if path.is_dir() {
+                // Try to load partition metadata
+                if let Some(partition_id) = path.file_name().and_then(|n| n.to_str()) {
+                    let metadata_path = path.join("partition.meta");
+                    
+                    if metadata_path.exists() {
+                        let metadata_bytes = fs::read(&metadata_path)?;
+                        let metadata: PartitionMetadata = bincode::deserialize(&metadata_bytes)
+                            .map_err(|e| {
+                                StorageError::InvalidConfig(format!(
+                                    "Failed to deserialize partition metadata: {}",
+                                    e
+                                ))
+                            })?;
+                        
+                        partitions.insert(partition_id.to_string(), metadata.clone());
+                        
+                        // Load active block if any
+                        if let Some(active_block_id) = &metadata.active_block {
+                            let block_path = path.join(format!("{}.block", active_block_id));
+                            if block_path.exists() {
+                                let block = Block::open(block_path)?;
+                                
+                                if block.status() == BlockStatus::Active {
+                                    let mut active_blocks = self.active_blocks.write().unwrap();
+                                    active_blocks.insert(
+                                        partition_id.to_string(),
+                                        Arc::new(Mutex::new(block)),
+                                    );
+                                }
+                            }
+                        }
+                        
+                        // Load all block metadata
+                        for block_id in &metadata.blocks {
+                            self.load_block_metadata(partition_id, block_id)?;
+                        }
+                    }
+                }
+            }
+        }
+        
+        log::info!("Loaded {} partitions", partitions.len());
+        
+        Ok(())
+    }
+    
+    /// Load block metadata into cache
+    fn load_block_metadata(
+        &self,
+        partition_id: &str,
+        block_id: &str,
+    ) -> Result<(), StorageError> {
+        let partition_dir = self.data_dir.join(partition_id);
+        
+        // Try different file extensions
+        let extensions = ["block", "block.archive", "meta"];
+        
+        for ext in &extensions {
+            let path = partition_dir.join(format!("{}.{}", block_id, ext));
+            
+            if path.exists() {
+                let block = Block::open(path)?;
+                let metadata = block.metadata().clone();
+                
+                let mut block_metadata = self.block_metadata.write().unwrap();
+                block_metadata.insert(format!("{}:{}", partition_id, block_id), metadata);
+                
+                return Ok(());
+            }
+        }
+        
+        Err(StorageError::BlockNotFound(format!(
+            "Block not found: {}:{}",
+            partition_id, block_id
+        )))
+    }
+    
+    /// Start background maintenance tasks
+    fn start_maintenance(&self) {
+        let config = self.config.clone();
+        let data_dir = self.data_dir.clone();
+        let shutdown = self.shutdown.clone();
+        
+        let handle = thread::spawn(move || {
+            let mut next_housekeeping = Instant::now();
+            
+            while !*shutdown.read().unwrap() {
+                // Sleep for a bit
+                thread::sleep(Duration::from_secs(1));
+                
+                // Check if it's time for housekeeping
+                if Instant::now() >= next_housekeeping {
+                    // Perform maintenance tasks
+                    if let Err(e) = Self::maintenance_task(&data_dir, &config) {
+                        log::error!("Maintenance task error: {}", e);
+                    }
+                    
+                    // Schedule next run (every 15 minutes)
+                    next_housekeeping = Instant::now() + Duration::from_secs(15 * 60);
+                }
+            }
+        });
+        
+        // Store the handle
+        let this = self as *const _ as *mut StorageManager;
+        unsafe {
+            (*this).maintenance_handle = Some(handle);
+        }
+    }
+    
+    /// Background maintenance tasks
+    fn maintenance_task(
+        data_dir: &Path,
+        config: &StorageConfig,
+    ) -> Result<(), StorageError> {
+        log::info!("Running maintenance tasks");
+        
+        // Archive old blocks
+        Self::archive_old_blocks(data_dir, config)?;
+        
+        // Apply retention policy
+        Self::apply_retention_policy(data_dir, config)?;
+        
+        // Enforce storage limits
+        Self::enforce_storage_limits(data_dir, config)?;
+        
+        log::info!("Maintenance tasks completed");
+        
+        Ok(())
+    }
+    
+    /// Archive old blocks to save space
+    fn archive_old_blocks(
+        data_dir: &Path,
+        config: &StorageConfig,
+    ) -> Result<(), StorageError> {
+        // Find all partition directories
+        let entries = fs::read_dir(data_dir)?;
+        
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if path.is_dir() {
+                // Find all block files
+                let block_entries = fs::read_dir(&path)?;
+                
+                for block_entry in block_entries {
+                    let block_entry = block_entry?;
+                    let block_path = block_entry.path();
+                    
+                    // Only process .block files that are not active
+                    if block_path.extension().and_then(|e| e.to_str()) == Some("block") {
+                        // Skip active blocks
+                        if let Ok(block) = Block::open(block_path.clone()) {
+                            if block.status() == BlockStatus::Sealed {
+                                // Archive the block
+                                log::info!("Archiving block: {}", block_path.display());
+                                let mut block = block;
+                                block.archive(config.compression_level)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Apply retention policy and delete old blocks
+    fn apply_retention_policy(
+        data_dir: &Path,
+        config: &StorageConfig,
+    ) -> Result<(), StorageError> {
+        // Skip if retention is disabled
+        if config.retention_days == 0 {
+            return Ok(());
+        }
+        
+        let now = Utc::now();
+        let retention_threshold = now - chrono::Duration::days(config.retention_days as i64);
+        
+        log::info!(
+            "Applying retention policy: deleting blocks older than {}",
+            retention_threshold
+        );
+        
+        // Find all partition directories
+        let entries = fs::read_dir(data_dir)?;
+        
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if path.is_dir() {
+                // Find all block files
+                let block_entries = fs::read_dir(&path)?;
+                
+                for block_entry in block_entries {
+                    let block_entry = block_entry?;
+                    let block_path = block_entry.path();
+                    
+                    // Process block files and metadata
+                    let extensions = ["block", "block.archive", "meta"];
+                    if let Some(ext) = block_path.extension().and_then(|e| e.to_str()) {
+                        if extensions.contains(&ext) {
+                            // Open the block to check its metadata
+                            if let Ok(block) = Block::open(block_path.clone()) {
+                                let metadata = block.metadata();
+                                
+                                // Check if the block is older than retention threshold
+                                if metadata.created_at < retention_threshold
+                                    && metadata.marked_for_deletion
+                                {
+                                    // Delete the block
+                                    log::info!("Deleting old block: {}", block_path.display());
+                                    block.delete()?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Enforce storage limits
+    fn enforce_storage_limits(
+        data_dir: &Path,
+        config: &StorageConfig,
+    ) -> Result<(), StorageError> {
+        // Skip if no storage limit
+        if config.max_storage_size == 0 {
+            return Ok(());
+        }
+        
+        // Calculate current storage size
+        let mut total_size = 0u64;
+        let mut blocks_info = Vec::new();
+        
+        // Find all partition directories
+        let entries = fs::read_dir(data_dir)?;
+        
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if path.is_dir() {
+                // Find all block files
+                let block_entries = fs::read_dir(&path)?;
+                
+                for block_entry in block_entries {
+                    let block_entry = block_entry?;
+                    let block_path = block_entry.path();
+                    let metadata = fs::metadata(&block_path)?;
+                    
+                    total_size += metadata.len();
+                    
+                    // Only collect info for actual block files
+                    let extensions = ["block", "block.archive"];
+                    if let Some(ext) = block_path.extension().and_then(|e| e.to_str()) {
+                        if extensions.contains(&ext) {
+                            if let Ok(block) = Block::open(block_path.clone()) {
+                                let block_metadata = block.metadata().clone();
+                                blocks_info.push((block_path.clone(), block_metadata));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Check if we need to free up space
+        if total_size > config.max_storage_size {
+            log::warn!(
+                "Storage limit exceeded: {} bytes used, {} bytes limit",
+                total_size,
+                config.max_storage_size
+            );
+            
+            // Sort blocks by creation time (oldest first)
+            blocks_info.sort_by(|a, b| a.1.created_at.cmp(&b.1.created_at));
+            
+            // Mark blocks for deletion until we're under the limit
+            let mut size_to_free = total_size - config.max_storage_size;
+            let mut freed = 0u64;
+            
+            for (path, _) in &blocks_info {
+                if freed >= size_to_free {
+                    break;
+                }
+                
+                let metadata = fs::metadata(path)?;
+                freed += metadata.len();
+                
+                // Mark this block for deletion
+                log::info!("Marking block for deletion: {}", path.display());
+                
+                let mut block = Block::open(path.clone())?;
+                block.mark_for_deletion()?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Create a new partition
+    pub fn create_partition(&self, name: &str) -> Result<String, StorageError> {
+        let partition_id = Uuid::new_v4().to_string();
+        let partition_dir = self.data_dir.join(&partition_id);
+        
+        // Create partition directory
+        fs::create_dir_all(&partition_dir)?;
+        
+        // Create partition metadata
+        let metadata = PartitionMetadata {
+            id: partition_id.clone(),
+            name: name.to_string(),
+            created_at: Utc::now(),
+            blocks: Vec::new(),
+            active_block: None,
+            entry_count: 0,
+            size_bytes: 0,
+        };
+        
+        // Save metadata
+        let metadata_path = partition_dir.join("partition.meta");
+        let metadata_bytes = bincode::serialize(&metadata).map_err(|e| {
+            StorageError::InvalidConfig(format!("Failed to serialize partition metadata: {}", e))
+        })?;
+        fs::write(&metadata_path, metadata_bytes)?;
+        
+        // Update in-memory state
+        self.partitions
+            .write()
+            .unwrap()
+            .insert(partition_id.clone(), metadata);
+        
+        log::info!("Created partition: {} ({})", name, partition_id);
+        
+        Ok(partition_id)
+    }
+    
+    /// Get partition metadata
+    pub fn get_partition(&self, partition_id: &str) -> Result<PartitionMetadata, StorageError> {
+        self.partitions
+            .read()
+            .unwrap()
+            .get(partition_id)
+            .cloned()
+            .ok_or_else(|| StorageError::PartitionNotFound(partition_id.to_string()))
+    }
+    
+    /// List all partitions
+    pub fn list_partitions(&self) -> Vec<PartitionMetadata> {
+        self.partitions
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
+    }
+    
+    /// Get active block for a partition
+    fn get_active_block(
+        &self,
+        partition_id: &str,
+    ) -> Result<Arc<Mutex<Block>>, StorageError> {
+        // Check if we already have an active block
+        {
+            let active_blocks = self.active_blocks.read().unwrap();
+            if let Some(block) = active_blocks.get(partition_id) {
+                return Ok(block.clone());
+            }
+        }
+        
+        // No active block, create a new one
+        let block_id = Uuid::new_v4().to_string();
+        let partition_dir = self.data_dir.join(partition_id);
+        
+        // Create new block
+        let block = Block::create(
+            block_id.clone(),
+            &partition_dir,
+            self.config.compression,
+        )?;
+        
+        // Update partition metadata
+        {
+            let mut partitions = self.partitions.write().unwrap();
+            if let Some(metadata) = partitions.get_mut(partition_id) {
+                metadata.blocks.push(block_id.clone());
+                metadata.active_block = Some(block_id.clone());
+                
+                // Save updated metadata
+                let metadata_path = partition_dir.join("partition.meta");
+                let metadata_bytes = bincode::serialize(&metadata).map_err(|e| {
+                    StorageError::InvalidConfig(format!(
+                        "Failed to serialize partition metadata: {}",
+                        e
+                    ))
+                })?;
+                fs::write(&metadata_path, metadata_bytes)?;
+            } else {
+                return Err(StorageError::PartitionNotFound(partition_id.to_string()));
+            }
+        }
+        
+        // Store block in active blocks map
+        let block_arc = Arc::new(Mutex::new(block));
+        self.active_blocks
+            .write()
+            .unwrap()
+            .insert(partition_id.to_string(), block_arc.clone());
+        
+        Ok(block_arc)
+    }
+    
+    /// Append a log entry to a partition
+    pub fn append(
+        &self,
+        partition_id: &str,
+        entry: LogEntry,
+    ) -> Result<u64, StorageError> {
+        // Get the active block
+        let block_arc = self.get_active_block(partition_id)?;
+        let mut block = block_arc.lock().unwrap();
+        
+        // Check if block should be rotated
+        if block.should_rotate(&self.config.block_rotation) {
+            // Seal the current block
+            block.seal()?;
+            
+            // Create a new active block
+            let block_id = Uuid::new_v4().to_string();
+            let partition_dir = self.data_dir.join(partition_id);
+            
+            let new_block = Block::create(
+                block_id.clone(),
+                &partition_dir,
+                self.config.compression,
+            )?;
+            
+            // Update partition metadata
+            {
+                let mut partitions = self.partitions.write().unwrap();
+                if let Some(metadata) = partitions.get_mut(partition_id) {
+                    metadata.blocks.push(block_id.clone());
+                    metadata.active_block = Some(block_id.clone());
+                    
+                    // Save updated metadata
+                    let metadata_path = partition_dir.join("partition.meta");
+                    let metadata_bytes = bincode::serialize(&metadata).map_err(|e| {
+                        StorageError::InvalidConfig(format!(
+                            "Failed to serialize partition metadata: {}",
+                            e
+                        ))
+                    })?;
+                    fs::write(&metadata_path, metadata_bytes)?;
+                }
+            }
+            
+            // Replace block in map
+            *block = new_block;
+        }
+        
+        // Append the entry
+        let entry_id = block.append(entry)?;
+        
+        // Update partition metadata
+        {
+            let mut partitions = self.partitions.write().unwrap();
+            if let Some(metadata) = partitions.get_mut(partition_id) {
+                metadata.entry_count += 1;
+                metadata.size_bytes += block.metadata().uncompressed_size;
+                
+                // Save updated metadata
+                let metadata_path = self.data_dir.join(partition_id).join("partition.meta");
+                let metadata_bytes = bincode::serialize(&metadata).map_err(|e| {
+                    StorageError::InvalidConfig(format!(
+                        "Failed to serialize partition metadata: {}",
+                        e
+                    ))
+                })?;
+                fs::write(&metadata_path, metadata_bytes)?;
+            }
+        }
+        
+        Ok(entry_id)
+    }
+    
+    /// Read a log entry from a partition
+    pub fn read_entry(
+        &self,
+        partition_id: &str,
+        block_id: &str,
+        entry_id: u64,
+    ) -> Result<LogEntry, StorageError> {
+        // Check active blocks first
+        {
+            let active_blocks = self.active_blocks.read().unwrap();
+            if let Some(block_arc) = active_blocks.get(partition_id) {
+                let block = block_arc.lock().unwrap();
+                if block.metadata().id == block_id {
+                    return Ok(block.read_entry(entry_id)?);
+                }
+            }
+        }
+        
+        // Open the block file
+        let partition_dir = self.data_dir.join(partition_id);
+        
+        // Try different file extensions
+        let extensions = ["block", "block.archive", "meta"];
+        
+        for ext in &extensions {
+            let path = partition_dir.join(format!("{}.{}", block_id, ext));
+            
+            if path.exists() {
+                let block = Block::open(path)?;
+                return Ok(block.read_entry(entry_id)?);
+            }
+        }
+        
+        Err(StorageError::BlockNotFound(format!(
+            "Block not found: {}:{}",
+            partition_id, block_id
+        )))
+    }
+    
+    /// Shut down the storage manager
+    pub fn shutdown(&mut self) -> Result<(), StorageError> {
+        // Signal background tasks to stop
+        *self.shutdown.write().unwrap() = true;
+        
+        // Wait for background tasks to finish
+        if let Some(handle) = self.maintenance_handle.take() {
+            if handle.join().is_err() {
+                log::error!("Failed to join maintenance thread");
+            }
+        }
+        
+        // Seal all active blocks
+        {
+            let active_blocks = self.active_blocks.read().unwrap();
+            for (partition_id, block_arc) in active_blocks.iter() {
+                let mut block = block_arc.lock().unwrap();
+                
+                if block.status() == BlockStatus::Active {
+                    if let Err(e) = block.seal() {
+                        log::error!("Failed to seal block for partition {}: {}", partition_id, e);
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+impl Drop for StorageManager {
+    fn drop(&mut self) {
+        // Signal background tasks to stop
+        *self.shutdown.write().unwrap() = true;
+        
+        // Note: We don't join the thread here to avoid blocking,
+        // TODO: We may want to handle this more gracefully in the future.
+    }
+}
+$$--GLUE--$$
+.\storage\mod.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// storage/mod.rs - Storage module for managing blocks, partitions, and logs
+
+pub mod block;
+pub mod compression;
+pub mod index;
+pub mod manager;
+
+use std::sync::{Arc, RwLock};
+use thiserror::Error;
+
+use crate::config::StorageConfig;
+use self::block::LogEntry;
+use self::manager::{PartitionMetadata, StorageError, StorageManager};
+
+// Storage errors wrapper
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("Storage error: {0}")]
+    Storage(#[from] StorageError),
+    
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+// Storage engine for TimberDB
+#[derive(Debug)]
+pub struct Storage {
+    // The storage manager
+    manager: Arc<StorageManager>,
+}
+
+impl Storage {
+    /// Create a new storage engine
+    pub fn new(config: StorageConfig) -> Result<Self, Error> {
+        let manager = StorageManager::new(config)?;
+        
+        Ok(Storage {
+            manager: Arc::new(manager),
+        })
+    }
+    
+    /// Create a new partition
+    pub fn create_partition(&self, name: &str) -> Result<String, Error> {
+        Ok(self.manager.create_partition(name)?)
+    }
+    
+    /// Get partition metadata
+    pub fn get_partition(&self, partition_id: &str) -> Result<PartitionMetadata, Error> {
+        Ok(self.manager.get_partition(partition_id)?)
+    }
+    
+    /// List all partitions
+    pub fn list_partitions(&self) -> Vec<PartitionMetadata> {
+        self.manager.list_partitions()
+    }
+    
+    /// Append a log entry to a partition
+    pub fn append(
+        &self,
+        partition_id: &str,
+        entry: LogEntry,
+    ) -> Result<u64, Error> {
+        Ok(self.manager.append(partition_id, entry)?)
+    }
+    
+    /// Read a log entry from a partition
+    pub fn read_entry(
+        &self,
+        partition_id: &str,
+        block_id: &str,
+        entry_id: u64,
+    ) -> Result<LogEntry, Error> {
+        Ok(self.manager.read_entry(partition_id, block_id, entry_id)?)
+    }
+    
+    /// Get a clone of the storage manager
+    pub fn manager(&self) -> Arc<StorageManager> {
+        self.manager.clone()
+    }
+    
+    /// Shutdown the storage engine
+    pub fn shutdown(self) -> Result<(), Error> {
+        // Get exclusive access to the manager
+        let mut manager = Arc::try_unwrap(self.manager)
+            .map_err(|_| {
+                Error::Storage(StorageError::InvalidConfig(
+                    "Storage manager still has active references".to_string(),
+                ))
+            })?;
+        
+        // Shut down the manager
+        manager.shutdown()?;
+        
+        Ok(())
+    }
+}
+$$--GLUE--$$
+.\util\logging.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// util/logging.rs - Logging configuration
+
+use std::io::{self, Write};
+use std::path::Path;
+
+use chrono::Local;
+use env_logger::Builder;
+use log::LevelFilter;
+
+use crate::config::Config;
+
+/// Initialize logging with configuration
+pub fn init_logging(config: &Config) -> Result<(), io::Error> {
+    // Parse log level
+    let level = match config.log_level.to_lowercase().as_str() {
+        "trace" => LevelFilter::Trace,
+        "debug" => LevelFilter::Debug,
+        "info" => LevelFilter::Info,
+        "warn" => LevelFilter::Warn,
+        "error" => LevelFilter::Error,
+        _ => LevelFilter::Info,
+    };
+    
+    // Create log directory if it doesn't exist
+    let log_dir = config.storage.data_dir.join("logs");
+    if !log_dir.exists() {
+        std::fs::create_dir_all(&log_dir)?;
+    }
+    
+    // Configure environment logger
+    let mut builder = Builder::new();
+    builder
+        .filter(None, level)
+        .format(|buf, record| {
+            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            writeln!(
+                buf,
+                "[{} {} {}:{}] {}",
+                timestamp,
+                record.level(),
+                record.file().unwrap_or("unknown"),
+                record.line().unwrap_or(0),
+                record.args()
+            )
+        });
+    
+    // Add file logger if log directory exists
+    if log_dir.exists() {
+        let log_file_path = log_dir.join(format!(
+            "timberdb_{}.log",
+            Local::now().format("%Y%m%d_%H%M%S")
+        ));
+        
+        let log_file = std::fs::File::create(log_file_path)?;
+        builder.target(env_logger::Target::Pipe(Box::new(log_file)));
+    }
+    
+    // Initialize the logger
+    builder.init();
+    
+    // Log the initialization
+    log::info!("Logging initialized at level: {}", level);
+    
+    Ok(())
+}
+
+/// Configure logging to a specific file
+pub fn configure_file_logging(
+    log_path: &Path,
+    level: LevelFilter,
+) -> Result<(), io::Error> {
+    // Create log directory if it doesn't exist
+    if let Some(parent) = log_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    
+    // Configure environment logger
+    let mut builder = Builder::new();
+    builder
+        .filter(None, level)
+        .format(|buf, record| {
+            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            writeln!(
+                buf,
+                "[{} {} {}:{}] {}",
+                timestamp,
+                record.level(),
+                record.file().unwrap_or("unknown"),
+                record.line().unwrap_or(0),
+                record.args()
+            )
+        });
+    
+    // Add file logger
+    let log_file = std::fs::File::create(log_path)?;
+    builder.target(env_logger::Target::Pipe(Box::new(log_file)));
+    
+    // Initialize the logger
+    builder.init();
+    
+    Ok(())
+}
+$$--GLUE--$$
+.\util\mod.rs
+$$--GLUE--$$
+// TimberDB: A high-performance distributed log database
+// util/mod.rs - Utility functions and modules
+
+pub mod logging;
+
+// Re-export main utilities
+pub use logging::init_logging;

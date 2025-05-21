@@ -1,0 +1,12 @@
+[2025-05-21 10:56:47.722 INFO src\util\logging.rs:63] Logging initialized at level: INFO
+[2025-05-21 10:56:47.722 INFO src\main.rs:72] Starting TimberDB v0.1.0
+[2025-05-21 10:56:47.722 INFO src\main.rs:73] Node ID: f94a0fbd-2649-4f14-adb6-d3e1e988169a
+[2025-05-21 10:56:47.722 INFO src\main.rs:74] Data directory: ./data
+[2025-05-21 10:56:47.722 INFO src\main.rs:75] Listening on: 127.0.0.1:7777
+[2025-05-21 10:56:47.722 INFO src\storage\manager.rs:109] Loading partitions from ./data
+[2025-05-21 10:56:47.723 INFO src\storage\manager.rs:161] Loaded 0 partitions
+[2025-05-21 10:56:47.723 INFO src\api\server.rs:126] Starting HTTP API server on 127.0.0.1:7777
+[2025-05-21 10:56:48.723 INFO src\storage\manager.rs:235] Running maintenance tasks
+[2025-05-21 10:56:48.723 INFO src\storage\manager.rs:246] Maintenance tasks completed
+[2025-05-21 10:57:11.175 INFO src\api\server.rs:165] Received termination signal, shutting down...
+[2025-05-21 10:57:11.175 INFO src\api\server.rs:140] Shutting down server due to signal
