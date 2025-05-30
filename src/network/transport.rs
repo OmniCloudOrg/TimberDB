@@ -1,5 +1,5 @@
-// TimberDB: A high-performance distributed log database
-// network/transport.rs - Network transport implementation (simplified)
+// TimberDB: Fixed transport.rs with memory safety checks
+// network/transport.rs - Network transport implementation with safety improvements
 
 use std::collections::HashMap;
 use std::io;
@@ -16,6 +16,12 @@ use tokio::time::timeout;
 
 use crate::config::NetworkConfig;
 use crate::network::consensus::RaftMessage;
+
+// Safety constants to prevent memory exhaustion
+const MAX_MESSAGE_SIZE: u32 = 256 * 1024 * 1024; // 256MB max message size
+const MIN_MESSAGE_SIZE: u32 = 1; // Minimum 1 byte
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Transport errors
 #[derive(Error, Debug)]
@@ -37,6 +43,12 @@ pub enum TransportError {
     
     #[error("Internal error: {0}")]
     Internal(String),
+    
+    #[error("Message too large: {0} bytes (max: {1})")]
+    MessageTooLarge(u32, u32),
+    
+    #[error("Invalid message size: {0}")]
+    InvalidMessageSize(u32),
 }
 
 // Message types for network transport
@@ -359,8 +371,7 @@ async fn listen(
     Ok(())
 }
 
-// Handle a single connection
-// Handle a single connection
+// Handle a single connection with safety checks
 async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
@@ -383,19 +394,11 @@ async fn handle_connection(
             .as_secs(),
     };
     
-    // Serialize the handshake message
-    let bytes = bincode::serialize(&handshake).map_err(|e| {
-        TransportError::Serialization(e.to_string())
-    })?;
+    // Send handshake with safety checks
+    send_message_safely(&mut write_half, &handshake).await?;
     
-    // Write message length and data
-    let len = bytes.len() as u32;
-    write_half.write_all(&len.to_be_bytes()).await?;
-    write_half.write_all(&bytes).await?;
-    write_half.flush().await?;
-    
-    // Receive handshake
-    let peer_handshake = match timeout(Duration::from_secs(5), read_message(&mut read_half)).await {
+    // Receive handshake with timeout and validation
+    let peer_handshake = match timeout(HANDSHAKE_TIMEOUT, read_message_safely(&mut read_half)).await {
         Ok(Ok(msg)) => msg,
         Ok(Err(e)) => return Err(e),
         Err(_) => return Err(TransportError::Timeout),
@@ -447,31 +450,12 @@ async fn handle_connection(
     
     // Spawn writer task
     let writer_last_activity = last_activity.clone();
+    let writer_peer_id = peer_id.clone();
     tokio::spawn(async move {
         while let Some(message) = peer_rx.recv().await {
-            // Serialize the message
-            let bytes = match bincode::serialize(&message) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    log::error!("Failed to serialize message: {}", e);
-                    continue;
-                }
-            };
-            
-            // Write message length and data
-            let len = bytes.len() as u32;
-            if let Err(e) = write_half.write_all(&len.to_be_bytes()).await {
-                log::error!("Failed to write message length: {}", e);
-                break;
-            }
-            
-            if let Err(e) = write_half.write_all(&bytes).await {
-                log::error!("Failed to write message data: {}", e);
-                break;
-            }
-            
-            if let Err(e) = write_half.flush().await {
-                log::error!("Failed to flush message: {}", e);
+            // Send message with safety checks
+            if let Err(e) = send_message_safely(&mut write_half, &message).await {
+                log::error!("Failed to send message to peer {}: {}", writer_peer_id, e);
                 break;
             }
             
@@ -480,12 +464,12 @@ async fn handle_connection(
         }
     });
     
-    // Reader loop
+    // Reader loop with safety checks
     loop {
-        // Read message with timeout
+        // Read message with timeout and validation
         let message = match timeout(
-            Duration::from_secs(config.timeout.as_secs() * 2),
-            read_message::<Message, _>(&mut read_half),
+            CONNECTION_TIMEOUT,
+            read_message_safely(&mut read_half),
         ).await {
             Ok(Ok(msg)) => msg,
             Ok(Err(e)) => {
@@ -525,6 +509,71 @@ async fn handle_connection(
     log::info!("Disconnected from peer {} ({})", peer_id, peer_addr);
     
     Ok(())
+}
+
+// Safely send a message with size validation
+async fn send_message_safely<W>(
+    writer: &mut W,
+    message: &Message,
+) -> Result<(), TransportError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    // Serialize the message
+    let bytes = bincode::serialize(message).map_err(|e| {
+        TransportError::Serialization(e.to_string())
+    })?;
+    
+    let len = bytes.len() as u32;
+    
+    // Validate message size
+    if len > MAX_MESSAGE_SIZE {
+        return Err(TransportError::MessageTooLarge(len, MAX_MESSAGE_SIZE));
+    }
+    
+    if len < MIN_MESSAGE_SIZE {
+        return Err(TransportError::InvalidMessageSize(len));
+    }
+    
+    // Write message length and data
+    writer.write_all(&len.to_be_bytes()).await?;
+    writer.write_all(&bytes).await?;
+    writer.flush().await?;
+    
+    Ok(())
+}
+
+// Safely read a message with size validation
+async fn read_message_safely<R>(
+    reader: &mut R,
+) -> Result<Message, TransportError>
+where
+    R: AsyncReadExt + Unpin,
+{
+    // Read message length
+    let mut len_bytes = [0u8; 4];
+    reader.read_exact(&mut len_bytes).await?;
+    let len = u32::from_be_bytes(len_bytes);
+    
+    // Validate message size
+    if len > MAX_MESSAGE_SIZE {
+        return Err(TransportError::MessageTooLarge(len, MAX_MESSAGE_SIZE));
+    }
+    
+    if len < MIN_MESSAGE_SIZE {
+        return Err(TransportError::InvalidMessageSize(len));
+    }
+    
+    // Read message data
+    let mut buffer = vec![0u8; len as usize];
+    reader.read_exact(&mut buffer).await?;
+    
+    // Deserialize the message
+    let message: Message = bincode::deserialize(&buffer).map_err(|e| {
+        TransportError::Serialization(e.to_string())
+    })?;
+    
+    Ok(message)
 }
 
 // Process transport commands
@@ -608,7 +657,7 @@ async fn send_to_peer(
     })
 }
 
-// Connect to a peer
+// Connect to a peer with safety checks
 async fn connect_to_peer(
     peers: &Arc<RwLock<HashMap<String, PeerConnection>>>,
     peer_id: String,
@@ -625,7 +674,7 @@ async fn connect_to_peer(
         }
     }
     
-    // Connect to peer
+    // Connect to peer with timeout
     let mut stream = match timeout(
         config.timeout,
         TcpStream::connect(addr),
@@ -650,22 +699,13 @@ async fn connect_to_peer(
             .as_secs(),
     };
     
-    // Serialize and send handshake
-    let bytes = bincode::serialize(&handshake).map_err(|e| {
-        TransportError::Serialization(e.to_string())
-    })?;
+    // Send handshake safely
+    send_message_safely(&mut stream, &handshake).await?;
     
-    
-    // Write message length and data
-    let len = bytes.len() as u32;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(&bytes).await?;
-    stream.flush().await?;
-    
-    // Receive handshake
+    // Receive handshake with timeout and validation
     let peer_handshake = match timeout(
-        Duration::from_secs(5),
-        read_message::<Message, _>(&mut stream),
+        HANDSHAKE_TIMEOUT,
+        read_message_safely(&mut stream),
     ).await {
         Ok(Ok(msg)) => msg,
         Ok(Err(e)) => return Err(e),
@@ -729,33 +769,5 @@ async fn connect_to_peer(
     
     peers.write().unwrap().insert(verified_peer_id.clone(), peer_conn);
     
-    // Note: We're not starting reader and writer tasks here since that would be
-    // handled by the listener when the peer connects back to us
-    
     Ok(())
-}
-
-// Read a message from a stream
-use tokio::io::AsyncRead;
-
-async fn read_message<T, R>(
-    reader: &mut R,
-) -> Result<T, TransportError>
-where
-    T: for<'de> Deserialize<'de>,
-    R: AsyncRead + Unpin,
-{
-    // Read message length
-    let mut len_bytes = [0u8; 4];
-    reader.read_exact(&mut len_bytes).await?;
-    let len = u32::from_be_bytes(len_bytes) as usize;
-    
-    // Read message data
-    let mut buffer = vec![0u8; len];
-    reader.read_exact(&mut buffer).await?;
-    
-    // Deserialize the message
-    bincode::deserialize(&buffer).map_err(|e| {
-        TransportError::Serialization(e.to_string())
-    })
 }
