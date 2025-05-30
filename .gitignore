@@ -18,3 +18,5 @@ target/
 /src/data
 /data
 *.log
+/src/timberdb_data
+/timberdb_data
