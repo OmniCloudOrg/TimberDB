@@ -1,0 +1,120 @@
+# TimberDB Configuration File
+# 
+# This configuration reflects the currently implemented features in TimberDB.
+# As new features are added, this configuration will be expanded.
+
+# =============================================================================
+# NODE CONFIGURATION
+# =============================================================================
+[node]
+# Unique identifier for this node in the cluster
+id = "timberdb-node-1"
+
+# Node role in the cluster
+# Options: "Leader", "Follower", "Observer"
+role = "Follower"
+
+# =============================================================================
+# STORAGE CONFIGURATION
+# =============================================================================
+[storage]
+# Primary data directory where TimberDB stores log data
+data_dir = "./data"
+
+# Block rotation policy - when to create new storage blocks
+# Currently supports time-based rotation
+block_rotation = { type = "time", value = 3600 }  # Rotate every hour
+
+# Compression algorithm
+# Options: "None", "LZ4", "Zstd", "Snappy", "Gzip"
+compression = "LZ4"
+
+# Compression level (algorithm-specific)
+compression_level = 3
+
+# Data retention in days (0 = keep forever)
+retention_days = 30
+
+# Maximum storage size in bytes (0 = unlimited)
+max_storage_size = 0
+
+# Sync writes to disk for durability (vs performance)
+sync_writes = true
+
+# =============================================================================
+# NETWORK AND CLUSTERING CONFIGURATION  
+# =============================================================================
+[network]
+# Address to listen on for client connections
+listen_addr = "127.0.0.1:7777"
+
+# List of peer node addresses for cluster formation
+# Leave empty for single-node deployment
+peers = []
+
+# Connection timeout in seconds
+timeout = 5
+
+# Maximum concurrent connections
+max_connections = 1000
+
+# Raft consensus settings for clustering
+election_timeout = 1000      # Milliseconds
+heartbeat_interval = 100     # Milliseconds
+
+# =============================================================================
+# QUERY ENGINE CONFIGURATION
+# =============================================================================
+[query]
+# Maximum number of results returned by any query
+max_results = 10000
+
+# Default timeout for queries in seconds
+timeout = 30
+
+# Enable query result caching
+enable_cache = true
+
+# Number of cached query results to keep
+cache_size = 1000
+
+# =============================================================================
+# LOGGING CONFIGURATION
+# =============================================================================
+# Global log level for TimberDB itself
+log_level = "info"  # Options: trace, debug, info, warn, error
+
+# =============================================================================
+# DEVELOPMENT NOTES
+# =============================================================================
+
+# This is a minimal configuration based on currently implemented features.
+# 
+# To run TimberDB with this config:
+#   timberdb --config timberdb.toml
+#
+# For single-node development:
+#   timberdb --data-dir ./data --listen 127.0.0.1:7777 --node-id dev-node
+#
+# Environment variable overrides:
+#   TIMBERDB_NODE_ID      -> node.id
+#   TIMBERDB_DATA_DIR     -> storage.data_dir  
+#   TIMBERDB_LISTEN_ADDR  -> network.listen_addr
+#   TIMBERDB_LOG_LEVEL    -> log_level
+
+# =============================================================================
+# PLANNED FEATURES (not yet implemented)
+# =============================================================================
+
+# The following sections represent planned features for future releases:
+#
+# [network.tls]          - TLS/SSL encryption
+# [auth]                 - Authentication and authorization  
+# [api]                  - HTTP API server configuration
+# [metrics.prometheus]   - Prometheus metrics integration
+# [logging.file]         - File-based logging configuration
+# [limits]               - Resource limits and quotas
+# [storage.advanced]     - Advanced storage tuning
+#
+# Check the GitHub repository for implementation status:
+# https://github.com/OmniCloudOrg/timberdb
